@@ -10,7 +10,7 @@ experiment:
   version: "1.0.0"
   description: "Collaborative Mutation-based MTD in DTMN"
   seeds: [42, 123, 456, 789, 1024]   # 5 independent seeds
-  device: "cuda"                        # "cuda" or "cpu"
+  device: "cpu"                        # "cuda" or "cpu"
   log_level: "INFO"
 
 # ─── Data Configuration ────────────────────────────────────
@@ -18,7 +18,7 @@ data:
   cicids2017_path: "data/cicids2017"     # Place CSV files here
   processed_path: "data/processed"
   synthetic_path: "data/synthetic"
-  use_synthetic: true                   # Set false when real data available
+  use_synthetic: false                   # Set false when real data available
 
   # Dataset splits
   train_split: 0.70

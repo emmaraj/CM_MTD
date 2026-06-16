@@ -1,5 +1,41 @@
+# ==========================================
+# Python / Virtual Environments
+# ==========================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
 # Virtual Environment
 venv/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# ==========================================
+# AI / Machine Learning / Data Science
+# ==========================================
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Model Weights & Checkpoints (Deep Learning / RL)
+*.h5
+*.hdf5
+*.keras
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+
+# Serialized Objects / Traditional ML Models
+*.pkl
+*.pickle
+*.joblib
 
 # Python
 __pycache__/
@@ -19,6 +55,33 @@ Thumbs.db
 
 # Logs
 *.log
+*.logs
+tensorboard_logs/
+wandb/
 
 # Database
 *.sqlite3
+
+# Ignore loose dataset files anywhere just in case
+*.csv
+*.tsv
+*.dat
+*.jsonl
+
+# ==========================================
+# IDEs & Editors (VSCode)
+# ==========================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# ==========================================
+# OS Specific (Linux / Ubuntu Mint)
+# ==========================================
+*~
+.fuse_hidden*
+.directory
+.Trash-*
