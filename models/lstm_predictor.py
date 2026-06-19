@@ -189,6 +189,7 @@ class LSTMAttackPredictor:
         verbose: int = 1,
         log_dir: str = "logs",
         checkpoint_path: str = "checkpoints/lstm_best.keras",
+        use_class_weights: bool = True,
     ) -> Dict:
         """
         Train the LSTM model with early stopping and LR scheduling.
@@ -246,6 +247,46 @@ class LSTMAttackPredictor:
 
         val_data = (X_val, y_val) if X_val is not None else None
 
+        # ── Class weights — critical for imbalanced attack datasets ──────────
+        # Cap at max_weight=20 to prevent extreme upweighting of classes
+        # with very few samples (e.g. Infiltration has only 36 in CICIDS-2017).
+        # Without the cap, weights of 8000x cause gradient instability and
+        # accuracy collapses below random chance.
+        class_weight_dict = None
+        if use_class_weights:
+            from sklearn.utils.class_weight import compute_class_weight
+            classes_present = np.unique(y_train)
+
+            # Drop classes with fewer than 50 samples — too few to learn
+            min_samples = 50
+            valid_classes = np.array([
+                c for c in classes_present
+                if np.sum(y_train == c) >= min_samples
+            ])
+            if len(valid_classes) < len(classes_present):
+                dropped = set(classes_present) - set(valid_classes)
+                logger.warning(
+                    "Dropping %d class(es) with < %d samples: %s "
+                    "(these are replaced by majority vote during prediction).",
+                    len(dropped), min_samples, dropped
+                )
+
+            weights = compute_class_weight(
+                class_weight="balanced",
+                classes=valid_classes,
+                y=y_train[np.isin(y_train, valid_classes)],
+            )
+
+            # Hard cap — prevents any single class dominating gradients
+            max_weight = 20.0
+            weights = np.clip(weights, 0.1, max_weight)
+
+            class_weight_dict = {int(c): float(w)
+                                 for c, w in zip(valid_classes, weights)}
+            logger.info("Class weights (capped at %.0fx): %s",
+                        max_weight,
+                        {k: f"{v:.2f}" for k, v in class_weight_dict.items()})
+
         self._history = self.model.fit(
             X_train, y_train,
             validation_data=val_data,
@@ -253,6 +294,7 @@ class LSTMAttackPredictor:
             batch_size=batch_size,
             callbacks=callbacks,
             verbose=verbose,
+            class_weight=class_weight_dict,
         )
 
         logger.info("LSTM training complete.")

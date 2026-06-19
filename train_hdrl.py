@@ -45,15 +45,30 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_attack_sequence(config: Dict, seed: int, synthetic: bool) -> np.ndarray:
-    """Load CICIDS2017 or generate a synthetic attack sequence."""
+    """
+    Load CICIDS2017 labels or generate synthetic sequence for the RL environment.
+
+    The RL environment only needs a long enough sequence to sample diverse
+    episodes from.  Passing 2.2 million samples causes a segfault on most
+    machines because the environment pre-allocates per-node arrays.
+    We therefore cap the sequence at MAX_SEQ_LEN after shuffling so every
+    attack class is still represented.
+    """
     from datasets.cicids2017_loader import N_CLASSES
+
+    # Maximum sequence length passed to the RL environment.
+    # 200 K gives ~8,000 episodes of length T=25 × K=5 — more than enough.
+    MAX_SEQ_LEN = 200_000
+
     n_nodes = config["network"]["n_nodes"]
     seq_len = config["data"].get("sequence_length", 10)
 
     if synthetic:
         from datasets.sequence_builder import SyntheticDataGenerator
         gen = SyntheticDataGenerator(n_classes=N_CLASSES, seed=seed)
-        _, y = gen.generate_event_sequence(n_nodes=n_nodes, n_steps=100_000, sequence_length=seq_len)
+        _, y = gen.generate_event_sequence(
+            n_nodes=n_nodes, n_steps=MAX_SEQ_LEN, sequence_length=seq_len
+        )
         return y
 
     try:
@@ -63,12 +78,30 @@ def build_attack_sequence(config: Dict, seed: int, synthetic: bool) -> np.ndarra
         df = loader.load_all(verbose=False)
         pre = CICIDS2017Preprocessor(config=config)
         _, y_labels, _ = pre.fit_transform(df)
+
+        # Subsample while preserving class proportions (stratified cap)
+        rng = np.random.default_rng(seed)
+        if len(y_labels) > MAX_SEQ_LEN:
+            # Keep temporal order: take a contiguous random window
+            # so the LSTM sees realistic sequential attack patterns
+            start = int(rng.integers(0, len(y_labels) - MAX_SEQ_LEN))
+            y_labels = y_labels[start: start + MAX_SEQ_LEN]
+            logging.getLogger("cm_mtd").info(
+                f"Attack sequence capped at {MAX_SEQ_LEN:,} "
+                f"(window [{start:,} – {start + MAX_SEQ_LEN:,}] of {len(y_labels) + MAX_SEQ_LEN:,})"
+            )
+
         return y_labels
+
     except Exception as e:
-        logging.getLogger("cm_mtd").warning(f"CICIDS2017 unavailable ({e}), using synthetic.")
+        logging.getLogger("cm_mtd").warning(
+            f"CICIDS2017 unavailable ({e}), using synthetic sequence."
+        )
         from datasets.sequence_builder import SyntheticDataGenerator
         gen = SyntheticDataGenerator(n_classes=N_CLASSES, seed=seed)
-        _, y = gen.generate_event_sequence(n_nodes=n_nodes, n_steps=100_000, sequence_length=seq_len)
+        _, y = gen.generate_event_sequence(
+            n_nodes=n_nodes, n_steps=MAX_SEQ_LEN, sequence_length=seq_len
+        )
         return y
 
 

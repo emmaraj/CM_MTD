@@ -138,13 +138,14 @@ def run(args: argparse.Namespace) -> None:
     logger.info("=" * 60)
 
     # ── Build attack sequence ─────────────────────────────────────────────────
+    MAX_SEQ_LEN = 200_000
     from datasets.cicids2017_loader import N_CLASSES
     if args.synthetic:
         from datasets.sequence_builder import SyntheticDataGenerator
         gen = SyntheticDataGenerator(n_classes=N_CLASSES, seed=42)
         _, attack_seq = gen.generate_event_sequence(
             n_nodes=config["network"]["n_nodes"],
-            n_steps=200_000,
+            n_steps=MAX_SEQ_LEN,
             sequence_length=config["data"].get("sequence_length", 10),
         )
     else:
@@ -155,13 +156,19 @@ def run(args: argparse.Namespace) -> None:
             df = loader.load_all(verbose=False)
             pre = CICIDS2017Preprocessor(config=config)
             _, attack_seq, _ = pre.fit_transform(df)
+            # Cap to prevent segfault — 200K gives 8000+ RL episodes
+            if len(attack_seq) > MAX_SEQ_LEN:
+                rng = np.random.default_rng(42)
+                start = int(rng.integers(0, len(attack_seq) - MAX_SEQ_LEN))
+                attack_seq = attack_seq[start: start + MAX_SEQ_LEN]
+                logger.info(f"Attack sequence capped at {MAX_SEQ_LEN:,} samples")
         except Exception:
             logger.warning("Falling back to synthetic attack sequence.")
             args.synthetic = True
             from datasets.sequence_builder import SyntheticDataGenerator
             gen = SyntheticDataGenerator(n_classes=N_CLASSES, seed=42)
             _, attack_seq = gen.generate_event_sequence(
-                n_nodes=config["network"]["n_nodes"], n_steps=200_000,
+                n_nodes=config["network"]["n_nodes"], n_steps=MAX_SEQ_LEN,
                 sequence_length=config["data"].get("sequence_length", 10),
             )
 

@@ -120,67 +120,74 @@ class SecurityEventSequenceBuilder:
         seed: int = 42,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Generate synthetic security event sequences for simulation.
-        
-        Models realistic attack patterns:
-        - Scanning (PortScan) followed by DoS/DDoS
-        - Temporal clustering of attacks on same nodes
-        - Background benign traffic
-        
-        Args:
-            n_nodes: Number of network nodes.
-            n_time_steps: Total time steps to simulate.
-            attack_schedule: Optional list of attack phase definitions.
-            seed: Random seed.
-        
+        Generate synthetic security event sequences with rich temporal structure.
+
+        Models a realistic cyber kill chain:
+          BENIGN  →  PortScan  →  Infiltration/BruteForce  →  Bot  →  DoS  →  DDoS
+        with stochastic transitions so LSTM can learn genuine sequential patterns.
+
+        All 8 CICIDS-2017 classes are represented in proportion similar to the
+        real dataset, so class weights and training remain meaningful.
+
         Returns:
-            events: shape [n_nodes, n_time_steps] — per-node event sequences.
-            X: shape [n_sequences, L] — LSTM input sequences.
-            Y: shape [n_sequences]    — LSTM targets.
+            events: [n_nodes, n_time_steps] per-node event matrix.
+            X:      [n_sequences, L] LSTM input windows.
+            Y:      [n_sequences]    LSTM targets (next event).
         """
-        rng = np.random.default_rng(seed)
-
-        # Default attack schedule: scan → DDoS cycles
-        if attack_schedule is None:
-            attack_schedule = [
-                {"start": 0,          "end": 1000, "type": "BENIGN"},
-                {"start": 1000,       "end": 2000, "type": "PortScan"},
-                {"start": 2000,       "end": 3000, "type": "DoS"},
-                {"start": 3000,       "end": 4000, "type": "DDoS"},
-                {"start": 4000,       "end": 5000, "type": "BENIGN"},
-            ]
-
         from datasets.cicids2017_loader import ATTACK_CLASS_MAP
 
-        # Build per-node event sequences
+        rng = np.random.default_rng(seed)
+
+        # ── Markov transition matrix (rows = current, cols = next) ───────────
+        # Encodes realistic kill-chain progressions:
+        #   BENIGN → mostly stays BENIGN, sometimes PortScan starts
+        #   PortScan → leads to Infiltration / BruteForce
+        #   Infiltration/BruteForce → leads to Bot installation
+        #   Bot → leads to DoS preparation
+        #   DoS → escalates to DDoS or returns to BENIGN
+        #   DDoS → heavy phase, eventually returns to BENIGN
+        # Class order: BENIGN=0, DoS=1, DDoS=2, PortScan=3,
+        #              Infiltration=4, Bot=5, BruteForce=6, WebAttack=7
+        T = np.array([
+            # BEN   DoS   DDoS  PScan  Inf   Bot   BF    Web
+            [0.82,  0.00, 0.00, 0.10,  0.02, 0.01, 0.03, 0.02],  # BENIGN
+            [0.20,  0.55, 0.20, 0.02,  0.01, 0.01, 0.01, 0.00],  # DoS
+            [0.15,  0.15, 0.60, 0.05,  0.02, 0.02, 0.01, 0.00],  # DDoS
+            [0.10,  0.05, 0.05, 0.45,  0.15, 0.10, 0.08, 0.02],  # PortScan
+            [0.10,  0.05, 0.05, 0.10,  0.40, 0.20, 0.08, 0.02],  # Infiltration
+            [0.05,  0.25, 0.30, 0.05,  0.05, 0.25, 0.03, 0.02],  # Bot
+            [0.10,  0.05, 0.05, 0.20,  0.20, 0.10, 0.25, 0.05],  # BruteForce
+            [0.30,  0.05, 0.05, 0.15,  0.10, 0.05, 0.10, 0.20],  # WebAttack
+        ], dtype=np.float64)
+
+        # Normalise rows (should already sum to 1, but be safe)
+        T = T / T.sum(axis=1, keepdims=True)
+
+        # ── Generate one long Markov chain per node ───────────────────────────
         events = np.zeros((n_nodes, n_time_steps), dtype=np.int64)
+        for node in range(n_nodes):
+            # Each node starts in a slightly different state for diversity
+            state = int(rng.choice(self.n_classes, p=[0.7,0.05,0.05,0.1,0.02,0.02,0.04,0.02]))
+            for t in range(n_time_steps):
+                events[node, t] = state
+                state = int(rng.choice(self.n_classes, p=T[state]))
 
-        for phase in attack_schedule:
-            start, end = phase["start"], phase["end"]
-            atk_type = phase["type"]
-            atk_id = ATTACK_CLASS_MAP.get(atk_type, 0)
+        # ── Apply custom schedule override if provided ────────────────────────
+        if attack_schedule is not None:
+            for phase in attack_schedule:
+                start = phase["start"]
+                end   = min(phase["end"], n_time_steps)
+                atk_id = ATTACK_CLASS_MAP.get(phase["type"], 0)
+                if phase["type"] == "BENIGN":
+                    events[:, start:end] = 0
+                else:
+                    n_targets = max(1, n_nodes // 2)
+                    targets = rng.choice(n_nodes, n_targets, replace=False)
+                    events[np.ix_(targets, np.arange(start, end))] = atk_id
 
-            # Randomly select target nodes for each attack phase
-            if atk_type == "BENIGN":
-                events[:, start:end] = 0  # all nodes benign
-            else:
-                n_targets = max(1, n_nodes // 2)
-                target_nodes = rng.choice(n_nodes, n_targets, replace=False)
-                # Spread attack with some randomness
-                for t in range(start, min(end, n_time_steps)):
-                    for node in target_nodes:
-                        if rng.random() < 0.7:  # 70% probability of attack event
-                            events[node, t] = atk_id
-                        else:
-                            events[node, t] = 0  # benign
-
-        # Flatten per-node sequences into global sequence
-        all_events = events.flatten()
-
-        # Add some noise (random minor attacks)
-        noise_idx = rng.choice(len(all_events), size=len(all_events) // 20, replace=False)
-        noise_labels = rng.integers(0, self.n_classes, size=len(noise_idx))
-        all_events[noise_idx] = noise_labels
+        # Flatten: interleave nodes so all nodes contribute to one sequence
+        # Shape: [n_nodes * n_time_steps] → LSTM sees mixed-node stream
+        all_events = events.flatten(order="F")  # column-major: time first
 
         X, Y = self._sliding_window(all_events)
 

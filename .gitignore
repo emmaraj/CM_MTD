@@ -58,6 +58,7 @@ Thumbs.db
 *.logs
 tensorboard_logs/
 wandb/
+logs/
 
 # Database
 *.sqlite3

@@ -140,13 +140,15 @@ def run(args: argparse.Namespace) -> None:
         X_train, y_train,
         X_val=X_val, y_val=y_val,
         epochs=epochs,
-        batch_size=lstm_cfg.get("batch_size", 256),
-        patience=lstm_cfg.get("early_stopping_patience", 10),
-        lr_patience=lstm_cfg.get("lr_reduce_patience", 5),
+        batch_size=lstm_cfg.get("batch_size", 128),
+        patience=lstm_cfg.get("early_stopping_patience", 15),
+        lr_patience=lstm_cfg.get("lr_reduce_patience", 8),
         lr_factor=lstm_cfg.get("lr_reduce_factor", 0.5),
+        min_lr=lstm_cfg.get("min_lr", 1e-5),
         checkpoint_path="checkpoints/lstm_best.keras",
         log_dir="logs",
         verbose=1,
+        use_class_weights=lstm_cfg.get("use_class_weights", True),
     )
 
     # ── Evaluate ──────────────────────────────────────────────────────────────

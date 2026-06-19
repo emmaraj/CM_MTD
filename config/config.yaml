@@ -10,7 +10,7 @@ experiment:
   version: "1.0.0"
   description: "Collaborative Mutation-based MTD in DTMN"
   seeds: [42, 123, 456, 789, 1024]   # 5 independent seeds
-  device: "cpu"                        # "cuda" or "cpu"
+  device: "cuda"                        # "cuda" or "cpu"
   log_level: "INFO"
 
 # ─── Data Configuration ────────────────────────────────────
@@ -18,7 +18,7 @@ data:
   cicids2017_path: "data/cicids2017"     # Place CSV files here
   processed_path: "data/processed"
   synthetic_path: "data/synthetic"
-  use_synthetic: false                   # Set false when real data available
+  use_synthetic: true                   # Set false when real data available
 
   # Dataset splits
   train_split: 0.70
@@ -71,25 +71,28 @@ label_mapping:
 # ─── LSTM Attack Prediction ────────────────────────────────
 lstm:
   # Architecture
-  embedding_dim: 64
+  embedding_dim: 32          # smaller → forces generalisation, not memorisation
   lstm_units: [128, 64]
-  dense_units: [128, 64]
-  dropout_rate: 0.3
-  recurrent_dropout: 0.2
-  n_classes: 8              # matches attack_labels count
+  dense_units: [64]          # simpler head → less overfitting on majority class
+  dropout_rate: 0.2          # was 0.3 — high dropout blocks minority class learning
+  recurrent_dropout: 0.1     # was 0.2
+  n_classes: 8               # matches attack_labels count
 
   # Training
   learning_rate: 0.001
-  batch_size: 256
+  batch_size: 128            # smaller batches → more diverse class exposure per step
   epochs: 100
-  early_stopping_patience: 10
-  lr_reduce_patience: 5
+  early_stopping_patience: 15  # give model more time to recover from LR drops
+  lr_reduce_patience: 8        # was 5 — stop cutting LR too aggressively
   lr_reduce_factor: 0.5
-  min_lr: 1.0e-6
+  min_lr: 1.0e-5             # was 1e-6 — stop reducing into useless territory
 
   # Regularization
-  l2_regularization: 1.0e-4
+  l2_regularization: 1.0e-5  # was 1e-4 — less penalisation on minority classes
   gradient_clip_norm: 1.0
+
+  # Class imbalance fix (applied automatically in train_lstm.py)
+  use_class_weights: true     # sklearn balanced weights — critical for CICIDS-2017
 
   # Evaluation
   metrics: ["accuracy", "precision", "recall", "f1", "confusion_matrix"]
