@@ -1,0 +1,6 @@
+Generate a prompt that I can give Claude so that it can generate the full code (to do the whole experiment in the paper) that I can run on the dataset to validate the results in the paper. I have attached a jupyter notebook that shows the preprocessing that has been done on the data and also how it has been saved so that the program will know how to consume it. 
+Also, the code should a single python script that handles simulation. 
+Also, Claude should generate a guide on how to setup my system (Linux Mint) to run the codes and also how to setup mininet for the project. 
+Claude should generate a Markdown file before it stops running so that it can read the contents on resumption
+
+
