@@ -1,6 +1,61 @@
-Generate a prompt that I can give Claude so that it can generate the full code (to do the whole experiment in the paper) that I can run on the dataset to validate the results in the paper. I have attached a jupyter notebook that shows the preprocessing that has been done on the data and also how it has been saved so that the program will know how to consume it. 
-Also, the code should a single python script that handles simulation. 
-Also, Claude should generate a guide on how to setup my system (Linux Mint) to run the codes and also how to setup mininet for the project. 
-Claude should generate a Markdown file before it stops running so that it can read the contents on resumption
+**Role and Objective**
+You are an expert AI/ML researcher and Network Security Engineer specializing in Software-Defined Networking (SDN), Moving Target Defense (MTD), and Deep Reinforcement Learning (DRL). Your task is to write a comprehensive guide and generate the code for a modular, well-structured Python simulation framework to replicate the "CM-MTD" architecture detailed in the provided paper: *When Moving Target Defense Meets Attack Prediction in Digital Twins: A Convolutional and Hierarchical Reinforcement Learning Approach*.
 
+**Attached Context**
+I have attached two files for your reference:
 
+1. **The Journal Paper:** Details the mathematical formulations, network constraints, and the CM-MTD architecture (LSTM + HDRL).
+2. **The Jupyter Notebook (`cicids2017.ipynb`):** Shows exactly how the CICIDS-2017 data was preprocessed, mapped, and saved.
+
+**Context: Data, Preprocessing, and Configuration**
+The preprocessed data is saved in the following format:
+
+* `X_train_env_state.npy` and `X_test_env_state.npy` (Standard scaled numerical features).
+* `y_train_env_state.npy` and `y_test_env_state.npy` (Encoded classes: 0 = Benign, 1 = DoS/DDoS, 2 = Infiltration).
+
+*Crucial Architecture Requirement:* I will swap this dataset for others in the future. Therefore, **the code must be entirely dataset-agnostic and configuration-driven.**
+
+* Do not hardcode input dimensions (e.g., dynamically infer `input_dim = X_train.shape[1]`).
+* Read all dataset paths, hyper-parameters, and model configurations from a `config.yaml` file.
+* **Strictly No Synthetic Data:** The simulation must purely step through the provided `.npy` empirical data traces to calculate states and rewards. Do not generate synthetic network traffic or randomized states using `np.random` for the environment stepping logic.
+
+**Context: The CM-MTD Architecture**
+The architecture consists of three main components:
+
+1. **Attack Prediction (LSTM):** Takes the environment state and predicts the future security state.
+2. **Upper Layer DRL (DQN):** Takes the LSTM state and selects a Macro-action (Deployment Strategy: Both HAM+RM, HAM only, RM only, Static).
+3. **Lower Layer DRL (PPO):** Takes the Macro-action and state, and selects the Micro-action.
+4. **Reward Function:** A combination of Defense Reward (maximizing Defense Success Ratio) and Resource Consumption Reward (penalizing overhead).
+
+**Your Deliverables**
+Please provide the following, structured logically:
+
+**1. System Setup Guide (Linux Mint)**
+Provide a step-by-step terminal guide to setting up my Linux Mint environment from scratch. This must include:
+
+* Installing Python dependencies (TensorFlow/Keras, Gym/Gymnasium, PyYAML, etc.).
+* Installing and setting up Mininet-WiFi and the Ryu SDN Controller from source or package managers natively on Linux Mint.
+* Highlight any known dependencies or potential pitfalls specific to Ubuntu/Mint derivatives.
+
+**2. Project Structure & YAML Configuration**
+
+* Outline a professional, modular project directory structure (e.g., `src/`, `config/`, `data/`, `models/`). Do **not** write a single-file script.
+* Provide a complete `config.yaml` template mapping out dataset paths, LSTM parameters, DQN/PPO parameters, and environment settings.
+
+**3. The Python Simulation Codebase**
+Generate the Python code separated into logical modules following good software engineering principles. Because running a full Mininet-WiFi + Ryu emulation alongside a DRL training loop is currently out of scope for the initial algorithm test, you must design a `gym.Env` (or `gymnasium.Env`) custom environment that mathematically *simulates* the network's state and rewards based on the paper's logic, stepping strictly through the `.npy` files.
+
+Provide the code for:
+
+* **`utils.py` or `config_parser.py`:** For loading the YAML and dynamically loading the `.npy` arrays.
+* **`environment.py`:** A custom Gym environment class that calculates DSR and Resource Consumption.
+* **`models.py`:** TensorFlow/Keras implementations of the LSTM, DQN, and PPO agents.
+* **`main.py`:** The main execution loop integrating the components and running the training process.
+
+**4. State Management (Markdown)**
+If you anticipate hitting your output length limit before completing the full codebase, pause at a logical file boundary. Before you stop, output a code block named `progress_state.md` summarizing exactly what has been built so far, and what files remain. This will allow me to prompt you to "Continue from progress_state.md" in the next message.
+
+**5. Clarifying Questions**
+Before you begin writing the code, list up to 3 highly specific technical questions about any ambiguities in the paper's mathematical formulations (e.g., specific coefficient values for the reward function or SMT constraints) that you need me to clarify. You can use placeholder variables in the config/code until I answer them.
+
+Please begin by acknowledging these instructions and starting with the Linux Mint Setup Guide and the Project Structure outline.

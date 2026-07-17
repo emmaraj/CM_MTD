@@ -1,0 +1,193 @@
+# =============================================================================
+# CM-MTD Configuration
+# When Moving Target Defense Meets Attack Prediction in Digital Twins
+# (Zhang et al., IEEE JSAC 2023)
+#
+# Every tunable in the pipeline lives here. Nothing in src/ hardcodes a
+# dataset-specific dimension, path, or hyperparameter — swap the `data:`
+# block to point at a different dataset and the rest of the pipeline
+# (LSTM -> DQN -> PPO) adapts automatically via shapes inferred at load time.
+# =============================================================================
+
+experiment:
+  name: "cm_mtd_cicids2017"
+  seed: 42
+  device: "cpu"          # "cpu" or "gpu" — see README for the TF/GPU notes
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  results_dir: "results"  # saved metrics (history, confusion matrix, reward curves) for scripts/generate_figures.py
+
+# -----------------------------------------------------------------------------
+# Dataset — paths are read by src/config_parser.py. input_dim and num_classes
+# are NEVER hardcoded; they are inferred from the .npy arrays at load time.
+# -----------------------------------------------------------------------------
+data:
+  x_train_path: "dataset/cicids2017/X_train_env_state.npy"
+  x_test_path: "dataset/cicids2017/X_test_env_state.npy"
+  y_train_path: "dataset/cicids2017/y_train_env_state.npy"
+  y_test_path: "dataset/cicids2017/y_test_env_state.npy"
+
+  # Class names, in label-encoder order (0..K-1). Purely cosmetic (logging/
+  # plots) — the code does not assume a class count. For CICIDS-2017 as
+  # preprocessed in cicids2017.ipynb, sklearn's LabelEncoder sorts
+  # alphabetically, giving: 0=Benign, 1=DoS/DDoS, 2=Infiltration.
+  class_names: ["Benign", "DoS/DDoS", "Infiltration"]
+
+  # Safety cap on how many rows the RL ENVIRONMENT cycles through for its
+  # per-node row assignment (a prior run segfaulted loading the full
+  # CICIDS-2017 label set directly into the env). This does NOT affect
+  # LSTM training -- src/main.py::train_lstm always uses the full,
+  # genuinely-contiguous dataset, since LSTM sequence windows need real
+  # row-to-row temporal adjacency that a truncated/reordered view would
+  # fragment. Set to null to disable and let the environment cycle
+  # through every row.
+  max_samples: 200000
+
+  # Row selection when max_samples < total rows (RL environment only --
+  # see above). "head" is a plain contiguous prefix (preserves order,
+  # but may under-represent rare classes in that prefix).
+  # "stratified_head" takes the first N rows per class instead, which
+  # guarantees class representation for the environment's HAM/RM logic
+  # but reorders rows relative to the original file -- fine here since
+  # the environment already assigns rows to nodes via an artificial
+  # round-robin, not genuine per-node temporal meaning.
+  truncation_strategy: "stratified_head"   # "head" | "stratified_head"
+
+# -----------------------------------------------------------------------------
+# LSTM Attack Predictor (Section VI-A, Eq. 11-12, Fig. 4)
+# Architecture: Dense projection ("event embedding") -> LSTM -> Dense -> Softmax
+# -----------------------------------------------------------------------------
+lstm:
+  sequence_length: 10        # L in Eq. 12 — length of history window
+  embedding_dim: 32          # projection width of the "event embedding layer"
+  lstm_units: [64]           # stacked LSTM layer sizes
+  dense_units: [32]
+  dropout: 0.2
+  learning_rate: 0.001
+  optimizer: "adam"          # paper specifies Adam (Section VI-A)
+  # Section VI-A literally specifies mean-squared-error loss for a softmax
+  # classification head, which is unusual and empirically less stable here
+  # than categorical crossentropy (especially combined with the severe
+  # class imbalance below). Defaulting to crossentropy; set to "mse" to
+  # match the paper exactly.
+  loss_function: "categorical_crossentropy"   # "categorical_crossentropy" | "mse"
+  batch_size: 256
+  epochs: 15
+  validation_split: 0.1
+
+  # CICIDS-2017's Infiltration class is extremely rare (~0.001% of rows).
+  # A naive `class_weight="balanced"` produces weights so large that
+  # training collapses (loss -> NaN, predictions collapse to one class).
+  # We use balanced weights but clip the max/min ratio.
+  # balanced_capped (inverse-frequency, then ratio-clipped) was the
+  # original default but was observed to overcorrect on real CICIDS-2017
+  # data: DoS/DDoS (14% of rows -- not actually rare) got boosted ~6x
+  # relative to Benign, which flipped the model from "always predict
+  # Benign" to "mostly predict DoS/DDoS" and made net accuracy WORSE than
+  # the trivial majority-class baseline. balanced_sqrt dampens the same
+  # inverse-frequency weights via sqrt (~2.4x DoS/DDoS:Benign instead of
+  # ~6x) -- gentler correction, less prone to swinging the decision
+  # boundary too far. Try balanced_capped again only if balanced_sqrt
+  # turns out to undercorrect on your data.
+  class_weight_strategy: "balanced_sqrt"   # "none" | "balanced" | "balanced_capped" | "balanced_sqrt"
+  max_class_weight_ratio: 20.0                # cap: max_weight <= ratio * min_weight
+
+# -----------------------------------------------------------------------------
+# Network / Digital Twin topology (Section III-A, Table I)
+# Generated with a Waxman random graph via NetworkX, consistent with the
+# paper's simulation setup.
+# -----------------------------------------------------------------------------
+network:
+  topology: "waxman"
+  num_nodes: 12               # |V ∪ M| — IoT/cloud nodes + OpenFlow switches
+  num_openflow_switches: 12
+  waxman_alpha: 0.2
+  waxman_beta: 0.15
+  num_ip_pools: 16            # w — candidate IP address spaces (paper range [30,150]; reduced for tractable action space)
+  num_flows: 8                # k — number of active flows needing routes
+  flow_table_capacity: 64     # C_cap_j in Eq. 9
+  link_delay_ms: 2.0          # T_l in Eq. 10
+  qos_delay_threshold_ms: 50.0  # C_del_y in Eq. 10
+
+# -----------------------------------------------------------------------------
+# Reward function (Section III-C-5, Eq. 1-3)
+#
+#   TODO(paper-clarify): α1, α2 (Eq. 1), C (positive constant, Eq. 1),
+#   γ1, γ2 (Eq. 2) are never given numeric values in the paper or its
+#   appendix. The values below are engineering placeholders chosen so that
+#   defense reward dominates resource-consumption penalty by roughly an
+#   order of magnitude (a common choice in MTD-RL literature), NOT values
+#   taken from the paper. Revisit if the authors' code/values surface.
+# -----------------------------------------------------------------------------
+reward:
+  alpha1: 1.0        # TODO(paper-clarify): weight on scan count Θ_t,i
+  alpha2: 2.0        # TODO(paper-clarify): weight on compromised-switch count Υ_t
+  positive_constant_C: 10.0   # TODO(paper-clarify): reward when no successful attack
+  gamma1: 0.05       # TODO(paper-clarify): HAM resource-consumption weight
+  gamma2: 0.05       # TODO(paper-clarify): RM resource-consumption weight
+
+  # TODO(paper-clarify): resource consumption model. Eq. 2 defines W_t via
+  # e^a_i (HAM cost per node) and e^r_y (RM cost per flow) but never states
+  # their units or how they scale with pool size / route length. Placeholder
+  # model: cost scales linearly with the number of nodes re-addressed /
+  # flows rerouted this step, normalized by network size.
+  resource_model: "linear_per_mutation"   # "linear_per_mutation" | "constant"
+  ham_unit_cost: 1.0
+  rm_unit_cost: 1.0
+
+# -----------------------------------------------------------------------------
+# Fidelity metric (Eq. 18) — categorical prediction accuracy across nodes.
+#   TODO(paper-clarify): Eq. 18 itself (Y(p_i,y_i) match indicator, averaged
+#   over |N|) is unambiguous as a formula, but the paper does not say
+#   whether N is "per time-slot across all nodes" or "cumulative over an
+#   evaluation window". We compute it per-batch during evaluation
+#   (matches Fig. 7's per-episode curves) — flagged here since it affects
+#   how directly figures are reproducible.
+# -----------------------------------------------------------------------------
+fidelity:
+  aggregation: "per_episode_batch"   # TODO(paper-clarify)
+
+# -----------------------------------------------------------------------------
+# Upper layer — DQN over macro-actions (Section VI-B, Eq. 13-14, Table I)
+# Macro-actions O = {o_c, o_a, o_r, o_s} = {HAM+RM, HAM-only, RM-only, STATIC}
+# -----------------------------------------------------------------------------
+dqn:
+  hidden_layers: [256]        # Table I
+  activation: "relu"          # Table I
+  learning_rate: 0.001        # Table I
+  gamma: 0.99
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_episodes: 3000
+  replay_buffer_size: 50000
+  batch_size: 64
+  target_update_every: 200    # steps, theta^u_{t-n} <- theta^u_t (line 42)
+  min_replay_before_train: 500
+
+# -----------------------------------------------------------------------------
+# Lower layer — PPO over micro-actions (Section VI-B, Eq. 15-17, Table I)
+# Actor outputs a Gaussian policy (paper's complexity analysis notes the
+# actor head has "2 neurons" = mean & log-std); the continuous sample is
+# mapped deterministically to an IP-pool index and a route index per flow.
+# -----------------------------------------------------------------------------
+ppo:
+  hidden_layers: [256, 256]   # Table I
+  activation: "tanh"          # Table I
+  learning_rate: 0.0001       # Table I
+  gamma: 0.99                 # Table I (GAE)
+  gae_lambda: 0.95            # Table I (GAE)
+  clip_epsilon: 0.2           # Table I
+  steps_per_macro_action: 25  # K, "number of steps on each episode" (Table I)
+  update_epochs: 10           # U in Algorithm 1
+  minibatch_size: 5           # Table I "mini-batch size"
+  entropy_coef: 0.01
+  value_coef: 0.5
+
+# -----------------------------------------------------------------------------
+# Training loop (Algorithm 1)
+# -----------------------------------------------------------------------------
+training:
+  num_episodes: 10000          # M in Algorithm 1 / Table I
+  steps_per_episode: 25        # T in Algorithm 1 / Table I ("steps on each episode")
+  eval_every_episodes: 100
+  save_every_episodes: 500

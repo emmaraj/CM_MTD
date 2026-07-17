@@ -69,6 +69,8 @@ logs/
 *.tsv
 *.dat
 *.jsonl
+*.npy
+dataset/cicids2017/*.npy
 
 # ==========================================
 # IDEs & Editors (VSCode)
@@ -87,3 +89,4 @@ logs/
 .fuse_hidden*
 .directory
 .Trash-*
+

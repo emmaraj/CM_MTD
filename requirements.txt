@@ -1,0 +1,24 @@
+# Core ML stack (pure TensorFlow — no PyTorch, see README for why)
+# Validated against 2.21 (Keras 3.15) during development; 2.16+ is fine too
+# since that's when TF made Keras 3 the default — everything here (Model,
+# layers, .save()/.load_model() with the .keras format) is Keras-3-native.
+tensorflow>=2.17
+numpy>=1.26
+scikit-learn>=1.4
+pandas>=2.1
+
+# RL environment
+gymnasium>=0.29
+
+# Networking / topology
+networkx>=3.2
+
+# Config
+pyyaml>=6.0
+
+# Plotting (for reproducing the paper's Fig. 7-11 style plots)
+matplotlib>=3.8
+seaborn>=0.13
+
+# Notebook (for cicids2017.ipynb preprocessing)
+jupyter>=1.0
