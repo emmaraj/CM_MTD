@@ -40,8 +40,16 @@ def rolling_mean(x: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(x, kernel, mode="valid")
 
 
+def _predictor_type_label(results_dir: str) -> str:
+    """Reads whichever evaluation_report_{type}.json exists to label figures correctly."""
+    for fname in os.listdir(results_dir) if os.path.isdir(results_dir) else []:
+        if fname.startswith("evaluation_report_") and fname.endswith(".json"):
+            return fname[len("evaluation_report_"):-len(".json")].upper()
+    return "Stage 2"
+
+
 def fig7_lstm_fidelity_loss(results_dir: str, out_dir: str) -> bool:
-    path = os.path.join(results_dir, "lstm_history.json")
+    path = os.path.join(results_dir, "stage2_history.json")
     if not os.path.exists(path):
         print(f"[skip] {path} not found -- run --mode train_lstm first.")
         return False
@@ -79,7 +87,7 @@ def fig7_lstm_fidelity_loss(results_dir: str, out_dir: str) -> bool:
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="center right", fontsize=8)
-    plt.title("LSTM attack predictor: fidelity & loss vs. training epoch\n(cf. paper Fig. 7)")
+    plt.title(f"{_predictor_type_label(results_dir)} attack predictor: fidelity & loss vs. training epoch\n(cf. paper Fig. 7)")
     plt.tight_layout()
 
     out_path = os.path.join(out_dir, "fig7_lstm_fidelity_loss.png")
@@ -90,7 +98,7 @@ def fig7_lstm_fidelity_loss(results_dir: str, out_dir: str) -> bool:
 
 
 def fig8_confusion_matrix(results_dir: str, out_dir: str) -> bool:
-    path = os.path.join(results_dir, "lstm_confusion.npz")
+    path = os.path.join(results_dir, "stage2_confusion.npz")
     if not os.path.exists(path):
         print(f"[skip] {path} not found -- run --mode train_lstm first.")
         return False
@@ -112,7 +120,7 @@ def fig8_confusion_matrix(results_dir: str, out_dir: str) -> bool:
     ax.set_yticklabels(class_names)
     ax.set_xlabel("Predicted")
     ax.set_ylabel("Reality")
-    ax.set_title(f"LSTM confusion matrix (cf. paper Fig. 8)\nFidelity={float(data['fidelity']):.4f}")
+    ax.set_title(f"{_predictor_type_label(results_dir)} confusion matrix (cf. paper Fig. 8)\nFidelity={float(data['fidelity']):.4f}")
 
     for i in range(num_classes):
         for j in range(num_classes):

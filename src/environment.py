@@ -359,52 +359,66 @@ class DigitalTwinNetworkEnv(gym.Env):
         return next_raw_events.copy(), r_total, terminated, truncated, info
 
 
-class LSTMStatePredictionWrapper(gym.Wrapper):
+class AttackPredictionStateWrapper(gym.Wrapper):
     """
-    Wraps DigitalTwinNetworkEnv so that the observation exposed to the
-    hierarchical agents is the LSTM's *predicted* next security-event
-    vector (matching the paper's SMDP state definition, Section III-C-1),
-    rather than the raw ground-truth event.
+    Wraps DigitalTwinNetworkEnv so the observation exposed to the
+    hierarchical agents is the two-stage attack predictor's *forecast* of
+    the next security-event vector (matching the paper's SMDP state
+    definition, Section III-C-1), rather than the raw ground-truth event.
+
+    Works with either LSTMAttackPredictor or TransformerAttackPredictor
+    (models.py) interchangeably -- both share the same
+    predict_next_events(label_window) interface, so swapping
+    config.predictor_type doesn't require touching this wrapper.
 
     Fig. 5's flowchart is: Environment --observations--> LSTM --state-->
-    DQN/PPO. This wrapper is exactly that arrow.
+    DQN/PPO. Concretely that arrow is now two hops: raw per-node features
+    -> Stage 1 (EventClassifier) turns them into a classified event label
+    -> Stage 2 forecasts the NEXT label from recent label history. See
+    models.py's EventClassifier docstring for why this is two stages
+    instead of one sequence model over raw features.
     """
 
-    def __init__(self, env: DigitalTwinNetworkEnv, lstm_predictor, sequence_length: int):
+    def __init__(self, env: DigitalTwinNetworkEnv, event_classifier, stage2_predictor, sequence_length: int):
         super().__init__(env)
-        self.lstm_predictor = lstm_predictor
+        self.event_classifier = event_classifier
+        self.stage2_predictor = stage2_predictor
         self.sequence_length = sequence_length
-        # History of per-node CONTINUOUS feature vectors (shape (n_nodes, input_dim)
-        # each), since the LSTM's input_dim is inferred from the dataset's feature
-        # width, not from the (tiny) number of event classes.
-        self._feature_history: list[np.ndarray] = []
+        # History of per-node CLASSIFIED EVENT LABELS (Stage 1's output),
+        # shape (n_nodes,) each -- Stage 2 operates on label sequences,
+        # not raw features (see models.py).
+        self._label_history: list[np.ndarray] = []
         self.observation_space = env.observation_space
 
-    def _push_history(self, features: np.ndarray) -> None:
-        self._feature_history.append(features)
-        if len(self._feature_history) > self.sequence_length:
-            self._feature_history.pop(0)
+    def _classify(self, features: np.ndarray) -> np.ndarray:
+        """features: (n_nodes, input_dim) -> (n_nodes,) predicted event labels."""
+        return self.event_classifier.predict(features)
+
+    def _push_history(self, labels: np.ndarray) -> None:
+        self._label_history.append(labels)
+        if len(self._label_history) > self.sequence_length:
+            self._label_history.pop(0)
 
     def _predicted_state(self) -> np.ndarray:
-        if len(self._feature_history) < self.sequence_length:
-            pad = [self._feature_history[0]] * (self.sequence_length - len(self._feature_history))
-            window = np.stack(pad + self._feature_history, axis=0)
+        if len(self._label_history) < self.sequence_length:
+            pad = [self._label_history[0]] * (self.sequence_length - len(self._label_history))
+            window = np.stack(pad + self._label_history, axis=0)
         else:
-            window = np.stack(self._feature_history, axis=0)
-        # window: (seq_len, n_nodes, input_dim) -> (n_nodes, seq_len, input_dim)
-        # for a batched, per-node prediction call.
-        window = np.transpose(window, (1, 0, 2))
-        return self.lstm_predictor.predict_next_events(window)
+            window = np.stack(self._label_history, axis=0)
+        # window: (seq_len, n_nodes) -> (n_nodes, seq_len) for a batched,
+        # per-node prediction call.
+        window = np.transpose(window, (1, 0))
+        return self.stage2_predictor.predict_next_events(window)
 
     def reset(self, **kwargs):
         _, info = self.env.reset(**kwargs)
-        self._feature_history = []
-        self._push_history(info["features"])
+        self._label_history = []
+        self._push_history(self._classify(info["features"]))
         predicted_state = self._predicted_state()
         return predicted_state, info
 
     def step(self, action):
         _, reward, terminated, truncated, info = self.env.step(action)
-        self._push_history(info["features"])
+        self._push_history(self._classify(info["features"]))
         predicted_state = self._predicted_state()
         return predicted_state, reward, terminated, truncated, info

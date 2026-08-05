@@ -1,20 +1,20 @@
 {
   "Benign": {
-    "precision": 0.8567508284468954,
-    "recall": 1.0,
-    "f1": 0.9228495448293795,
-    "support": 454257
+    "precision": 1.0,
+    "recall": 0.9999641650745272,
+    "f1": 0.9999820822162224,
+    "support": 530209
   },
   "DoS/DDoS": {
     "precision": 0.0,
     "recall": 0.0,
     "f1": 0.0,
-    "support": 75945
+    "support": 0
   },
   "Infiltration": {
     "precision": 0.0,
     "recall": 0.0,
     "f1": 0.0,
-    "support": 7
+    "support": 0
   }
 }

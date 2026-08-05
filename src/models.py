@@ -21,7 +21,7 @@ from typing import Optional
 
 import numpy as np
 import tensorflow as tf
-from tensorflow import keras
+import keras
 from tensorflow.keras import layers
 
 logger = logging.getLogger("cm_mtd")
@@ -33,22 +33,128 @@ def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     return e / np.sum(e, axis=axis, keepdims=True)
 
 
+@keras.saving.register_keras_serializable(package="cm_mtd")
+def categorical_focal_loss(gamma: float = 2.0):
+    """
+    Focal loss for multi-class classification (Lin et al., 2017, "Focal
+    Loss for Dense Object Detection").
+
+    A static class_weight multiplier applies the SAME fixed factor to
+    every example of a class for the entire training run. Empirically on
+    this project that produced a narrow, unstable corridor: a mild weight
+    (~2.4x DoS/DDoS:Benign) collapsed to always-predict-Benign, a stronger
+    one (~6x) overcorrected to mostly-predict-DoS/DDoS, and there was no
+    value in between that gave genuine learning -- two collapse modes,
+    no stable middle ground.
+
+    Focal loss instead down-weights individual EXAMPLES the model is
+    already confidently correct on (via the (1-p_t)^gamma factor,
+    regardless of class) and concentrates gradient signal on whatever's
+    currently hard to classify. This adapts continuously through
+    training rather than fixing one ratio up front, and composes with
+    class_weight (Keras applies class_weight as a per-sample multiplier
+    on top of whatever loss function returns, so the two aren't
+    mutually exclusive -- though typically you'd use one or the other).
+
+    Registered via @keras.saving.register_keras_serializable so a saved
+    model using this loss can be reloaded in a fresh process (plain
+    closures aren't deserializable -- without this, loading a checkpoint
+    trained with loss_function="focal" raises
+    "Could not locate function 'loss_fn'").
+    """
+    @keras.saving.register_keras_serializable(package="cm_mtd")
+    def loss_fn(y_true, y_pred):
+        y_pred = tf.clip_by_value(y_pred, 1e-8, 1.0 - 1e-8)
+        cross_entropy = -y_true * tf.math.log(y_pred)
+        modulating_factor = tf.pow(1.0 - y_pred, gamma)
+        return tf.reduce_sum(modulating_factor * cross_entropy, axis=-1)
+    return loss_fn
+
+
 # =============================================================================
-# LSTM Attack Predictor (Section VI-A, Eq. 11-12, Fig. 4)
+# Stage 1: Event Classifier (per-row raw features -> classified event label)
+# =============================================================================
+
+class EventClassifier:
+    """
+    Stage 1 of the attack-prediction pipeline: classifies each row's raw
+    features into a security-event class. The paper's Section IV frames
+    this as "detection logs" -- in a real deployment this role is played
+    by existing IDS/firewall/NetFlow tooling; here it's a Random Forest.
+
+    This exists because an earlier design fed raw per-row features
+    directly into the LSTM's sliding window (reasoning: richer input
+    should help). scripts/diagnose_separability.py proved that backwards:
+    a plain Random Forest gets ~100% recall on Benign/DoS-DDoS directly
+    from these features, while the identical features framed as an LSTM
+    sequence collapsed to a majority-class predictor no matter how the
+    loss/class-weighting was tuned. The features were never the problem;
+    treating flow-level rows (no inherent row-to-row temporal coherence)
+    as a time series was. This classifier does the part the data is
+    actually good for -- per-row classification -- and hands its output
+    to LSTMAttackPredictor (Stage 2) below, which does the part that's
+    genuinely sequential: predicting the next label from recent label
+    history.
+
+    input_dim/num_classes are inferred from the data, never hardcoded.
+    """
+
+    def __init__(self, n_estimators: int = 200, max_depth: Optional[int] = 16, seed: int = 42):
+        from sklearn.ensemble import RandomForestClassifier
+        self.model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            class_weight="balanced",
+            n_jobs=-1,
+            random_state=seed,
+        )
+        self._fitted = False
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        logger.info("Training Stage-1 event classifier (RandomForest, n_estimators=%d, max_depth=%s) on %d rows",
+                    self.model.n_estimators, self.model.max_depth, len(X))
+        self.model.fit(X, y)
+        self._fitted = True
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if not self._fitted:
+            raise RuntimeError("EventClassifier.fit() must be called before predict().")
+        return self.model.predict(X)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if not self._fitted:
+            raise RuntimeError("EventClassifier.fit() must be called before predict_proba().")
+        return self.model.predict_proba(X)
+
+    def save(self, path: str) -> None:
+        import joblib
+        joblib.dump(self.model, path)
+
+    def load(self, path: str) -> None:
+        import joblib
+        self.model = joblib.load(path)
+        self._fitted = True
+
+
+# =============================================================================
+# Stage 2: LSTM Attack Predictor -- next-event forecasting over LABEL
+# sequences (Section VI-A, Eq. 11-12, Fig. 4)
 # =============================================================================
 
 class LSTMAttackPredictor:
     """
-    Predicts the next security-event class for a node from its recent
-    history of CICIDS-2017 (or any config-swapped dataset's) feature
-    vectors. input_dim is inferred from the dataset, never hardcoded.
+    Predicts the next security-event class from the recent SEQUENCE of
+    per-row event labels already classified by Stage 1 (EventClassifier)
+    above. This matches the paper's own description (Section IV, Fig. 4):
+    the LSTM's input is already-classified discrete events from detection
+    logs, not raw continuous features -- see EventClassifier's docstring
+    for why this project moved to a two-stage design.
 
-    Architecture: per-timestep Dense projection ("event embedding layer",
-    Fig. 4) -> stacked LSTM -> Dense -> Softmax(num_classes).
+    Architecture: Embedding(num_classes, embedding_dim) ("event embedding
+    layer", Fig. 4) -> stacked LSTM -> Dense -> Softmax(num_classes).
     """
 
-    def __init__(self, input_dim: int, num_classes: int, cfg: dict):
-        self.input_dim = input_dim
+    def __init__(self, num_classes: int, cfg: dict):
         self.num_classes = num_classes
         self.cfg = cfg
         self.sequence_length = cfg["sequence_length"]
@@ -65,11 +171,8 @@ class LSTMAttackPredictor:
 
     def _build_model(self) -> keras.Model:
         cfg = self.cfg
-        inputs = layers.Input(shape=(self.sequence_length, self.input_dim), name="event_sequence")
-
-        x = layers.TimeDistributed(
-            layers.Dense(cfg["embedding_dim"], activation="relu"), name="event_embedding"
-        )(inputs)
+        inputs = layers.Input(shape=(self.sequence_length,), dtype="int32", name="event_label_sequence")
+        x = layers.Embedding(self.num_classes, cfg["embedding_dim"], name="event_embedding")(inputs)
 
         lstm_units = cfg["lstm_units"]
         for i, units in enumerate(lstm_units):
@@ -84,7 +187,8 @@ class LSTMAttackPredictor:
         outputs = layers.Dense(self.num_classes, activation="softmax", name="event_softmax")(x)
 
         model = keras.Model(inputs, outputs, name="lstm_attack_predictor")
-        loss = cfg.get("loss_function", "categorical_crossentropy")
+        loss_name = cfg.get("loss_function", "categorical_crossentropy")
+        loss = categorical_focal_loss(gamma=cfg.get("focal_gamma", 2.0)) if loss_name == "focal" else loss_name
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=cfg["learning_rate"]),
             loss=loss,
@@ -92,50 +196,49 @@ class LSTMAttackPredictor:
         )
         return model
 
-    def build_sliding_windows(self, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def build_sliding_windows(self, event_labels: np.ndarray,
+                               target_labels: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
         """
-        Turn a flat (n_samples, input_dim) trace into (window, next_label)
-        supervised pairs, per Eq. 12: X^t_k = {E^{t-L}_k,...,E^{t-1}_k},
-        Y^t_k = E^t_k. Windows are built with plain slicing over the
-        existing empirical order -- no shuffling, no synthetic rows.
+        event_labels: 1D array of per-row classified event ids (Stage 1's
+        output), in genuine chronological order.
+        target_labels: the REAL ground-truth label to predict for each
+        window (defaults to event_labels itself if not given, i.e. pure
+        self-prediction). Normally you pass the true y aligned to the
+        same rows, so Stage 2 learns to predict the actual future event
+        from Stage 1's (possibly imperfect) observed history -- not just
+        extrapolate Stage 1's own mistakes.
         """
+        if target_labels is None:
+            target_labels = event_labels
         L = self.sequence_length
-        n = len(X) - L
+        n = len(event_labels) - L
         if n <= 0:
             raise ValueError(
-                f"Dataset has only {len(X)} rows, fewer than sequence_length={L}; "
+                f"Only {len(event_labels)} rows, fewer than sequence_length={L}; "
                 f"cannot build any training windows."
             )
-        X_windows = np.stack([X[i:i + L] for i in range(n)], axis=0)
-        y_targets = y[L:L + n]
-        return X_windows, y_targets
+        windows = np.stack([event_labels[i:i + L] for i in range(n)], axis=0).astype(np.int32)
+        targets = target_labels[L:L + n]
+        return windows, targets
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray, class_weight: Optional[dict] = None,
-            seed: int = 42):
-        X_windows, y_targets = self.build_sliding_windows(X_train, y_train)
+    def fit(self, event_labels: np.ndarray, target_labels: Optional[np.ndarray] = None,
+            class_weight: Optional[dict] = None, seed: int = 42):
+        windows, targets = self.build_sliding_windows(event_labels, target_labels)
 
-        # keras.Model.fit's validation_split takes a contiguous slice off
-        # the END of whatever array you pass it -- it does NOT shuffle.
-        # X_windows is built from the full, genuinely time-ordered dataset
-        # (by design, so each window's internal sequence is real), which
-        # means the last validation_split fraction of *windows* is a
-        # single contiguous chunk of the original file -- e.g. whichever
-        # attack burst happened to land at the end. That produces a
-        # validation set that can be wildly unrepresentative (and
-        # explains val_accuracy swinging by 70 points epoch to epoch: a
-        # small decision-boundary shift flips an entire homogeneous
-        # block at once). Shuffling WINDOWS (not raw rows -- each window's
-        # own internal seq_len ordering is untouched) before the split
-        # fixes this while keeping every window's temporal content valid.
+        # Same validation-representativeness fix as before: Keras's
+        # validation_split slices a contiguous tail off whatever array you
+        # pass it. Shuffling WINDOWS (each window's own internal seq_len
+        # ordering untouched) before the split keeps that tail
+        # representative instead of one homogeneous chunk.
         rng = np.random.RandomState(seed)
-        perm = rng.permutation(len(X_windows))
-        X_windows, y_targets = X_windows[perm], y_targets[perm]
+        perm = rng.permutation(len(windows))
+        windows, targets = windows[perm], targets[perm]
 
-        y_onehot = keras.utils.to_categorical(y_targets, num_classes=self.num_classes)
-        logger.info("Training LSTM predictor on %d sequence windows (seq_len=%d, input_dim=%d)",
-                    len(X_windows), self.sequence_length, self.input_dim)
+        y_onehot = keras.utils.to_categorical(targets, num_classes=self.num_classes)
+        logger.info("Training LSTM predictor on %d label-sequence windows (seq_len=%d, num_classes=%d)",
+                    len(windows), self.sequence_length, self.num_classes)
         history = self.model.fit(
-            X_windows, y_onehot,
+            windows, y_onehot,
             batch_size=self.cfg["batch_size"],
             epochs=self.cfg["epochs"],
             validation_split=self.cfg["validation_split"],
@@ -144,46 +247,311 @@ class LSTMAttackPredictor:
         )
         return history
 
-    def predict_next_events(self, feature_window: np.ndarray) -> np.ndarray:
+    def predict_next_events(self, label_window: np.ndarray) -> np.ndarray:
         """
-        feature_window: (n_nodes, seq_len, input_dim) -> returns the
-        argmax predicted class id per node, shape (n_nodes,). This is
-        exactly the SMDP network state S_t (Section III-C-1).
+        label_window: (n_nodes, seq_len) integer event-label sequences ->
+        returns the argmax predicted class id per node, shape (n_nodes,).
+        This is exactly the SMDP network state S_t (Section III-C-1).
         """
-        x = tf.convert_to_tensor(feature_window, dtype=tf.float32)
+        x = tf.convert_to_tensor(label_window, dtype=tf.int32)
         probs = self._infer_fn(x).numpy()
         return np.argmax(probs, axis=-1)
 
-    def predict_proba(self, feature_window: np.ndarray) -> np.ndarray:
-        x = tf.convert_to_tensor(feature_window, dtype=tf.float32)
+    def predict_proba(self, label_window: np.ndarray) -> np.ndarray:
+        x = tf.convert_to_tensor(label_window, dtype=tf.int32)
         return self._infer_fn(x).numpy()
 
-    def predict_labels(self, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def predict_labels(self, event_labels: np.ndarray,
+                        target_labels: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
         """
-        Returns (y_true, y_pred) over sliding windows of (X, y) — the raw
-        material for a confusion matrix (paper's Fig. 8) or any other
-        metric beyond the single fidelity scalar in compute_fidelity().
+        Returns (y_true, y_pred) over sliding windows -- the raw material
+        for a confusion matrix (paper's Fig. 8) or any metric beyond the
+        single fidelity scalar in compute_fidelity().
         """
-        X_windows, y_targets = self.build_sliding_windows(X, y)
-        probs = self.model.predict(X_windows, verbose=0)
+        windows, targets = self.build_sliding_windows(event_labels, target_labels)
+        probs = self.model.predict(windows, verbose=0)
         preds = np.argmax(probs, axis=-1)
-        return y_targets, preds
+        return targets, preds
 
-    def compute_fidelity(self, X: np.ndarray, y: np.ndarray) -> dict:
+    def compute_fidelity(self, event_labels: np.ndarray, target_labels: Optional[np.ndarray] = None) -> dict:
         """
         Prediction accuracy fidelity, Eq. 18: Fidelity = sum_i Y(p_i,y_i) / |N|.
         Also returns per-class accuracy for the confusion-matrix-style
         breakdown reported in the paper's Table II.
         """
-        y_targets, preds = self.predict_labels(X, y)
+        targets, preds = self.predict_labels(event_labels, target_labels)
 
-        fidelity = float(np.mean(preds == y_targets))
+        fidelity = float(np.mean(preds == targets))
         per_class = {}
         for c in range(self.num_classes):
-            mask = y_targets == c
+            mask = targets == c
             if mask.sum() > 0:
                 per_class[c] = float(np.mean(preds[mask] == c))
-        return {"fidelity": fidelity, "per_class_accuracy": per_class, "n": len(y_targets)}
+        return {"fidelity": fidelity, "per_class_accuracy": per_class, "n": len(targets)}
+
+
+# =============================================================================
+# Stage 2 (alternative): Transformer Attack Predictor
+# =============================================================================
+
+@keras.saving.register_keras_serializable(package="cm_mtd")
+class PositionalEmbedding(layers.Layer):
+    """
+    A learned per-position embedding table, added directly to the token
+    embeddings it's called on. Deliberately NOT implemented as a separate
+    Embedding layer called on a tf.range() constant -- that constant has
+    no dependency on the model's Input, so Keras's functional-model graph
+    tracing does not reliably keep it retrievable via get_layer() after a
+    save/load round trip (confirmed by testing: it silently vanishes from
+    model.layers). Implementing this as a proper Layer with its own
+    add_weight(), called directly on the token embeddings (which DO derive
+    from Input), keeps it correctly connected and serializable.
+    """
+
+    def __init__(self, sequence_length: int, d_model: int, **kwargs):
+        super().__init__(**kwargs)
+        self.sequence_length = sequence_length
+        self.d_model = d_model
+
+    def build(self, input_shape):
+        self.pos_embedding = self.add_weight(
+            name="pos_embedding_table",
+            shape=(self.sequence_length, self.d_model),
+            initializer="random_normal",
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, token_embeddings):
+        return token_embeddings + self.pos_embedding[tf.newaxis, :, :]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"sequence_length": self.sequence_length, "d_model": self.d_model})
+        return config
+
+
+@keras.saving.register_keras_serializable(package="cm_mtd")
+class LastPositionSlice(layers.Layer):
+    """
+    Extracts the last timestep's representation from a
+    (batch, seq_len, d_model) tensor -- the Transformer's analogue of an
+    LSTM's final hidden state. NOT implemented as layers.Lambda(lambda
+    t: t[:, -1, :]): Keras 3 refuses to deserialize a Lambda wrapping a
+    Python closure by default (arbitrary-code-execution risk), which
+    would break loading a saved checkpoint in a fresh process -- the same
+    class of bug as the focal-loss closure serialization issue elsewhere
+    in this file. A plain registered Layer subclass has no such problem.
+    """
+
+    def call(self, x):
+        return x[:, -1, :]
+
+
+class TransformerAttackPredictor:
+    """
+    Drop-in alternative to LSTMAttackPredictor -- same interface
+    (fit/predict_next_events/predict_proba/predict_labels/compute_fidelity),
+    same input (Stage 1's event-label sequences), different sequence model.
+    See the methodology report for full justification; summary, INCLUDING
+    an honest negative result from scripts/compare_architectures.py:
+
+      - Predictive fidelity and class-fairness are statistically tied with
+        the LSTM on matched synthetic validation data (both architectures
+        learned the same short, low-cardinality event sequence equally
+        well) -- this is a "no regression" result, not a predictive win.
+      - Initial justification for this change assumed attention's
+        parallelizability would train faster than an LSTM's sequential
+        recurrence. Measured head-to-head (scripts/compare_architectures.py,
+        CPU, seq_len=10), that did NOT hold: the Transformer took ~1.7-2x
+        longer to train and used more estimated energy than the LSTM at
+        this scale. Self-attention's O(L^2) cost across 2 blocks x 4 heads
+        outweighs recurrence's sequential-but-O(L) cost when L is this
+        short; the parallelization advantage this architecture is known
+        for is real but needs longer sequences and/or GPU execution to
+        manifest, neither of which apply here. Reported plainly rather
+        than omitted.
+      - The genuine, scale-independent advantage is interpretability:
+        self-attention gives a directly inspectable weight over "which
+        past events mattered for this prediction" (see
+        get_attention_weights() / metrics.py::attention_entropy) that an
+        LSTM's opaque final hidden state does not offer without a separate
+        post-hoc method (e.g. SHAP/LIME) bolted on. This is the actual
+        basis for preferring it here, not speed.
+
+    Architecture: token Embedding(num_classes, d_model) + learned
+    positional Embedding(seq_len, d_model) -> N x [MultiHeadAttention ->
+    Add&Norm -> position-wise FeedForward -> Add&Norm] -> take the last
+    position's contextualized representation (analogous to an LSTM's
+    final hidden state) -> Dense -> Softmax(num_classes).
+    """
+
+    def __init__(self, num_classes: int, cfg: dict):
+        self.num_classes = num_classes
+        self.cfg = cfg
+        self.sequence_length = cfg["sequence_length"]
+        self.d_model = cfg.get("d_model", cfg.get("embedding_dim", 32))
+        self.num_heads = cfg.get("num_heads", 4)
+        self.num_blocks = cfg.get("num_transformer_blocks", 2)
+        self.d_ff = cfg.get("d_ff", self.d_model * 4)
+        self.model = self._build_model()
+        self._infer_fn = tf.function(
+            lambda x: self.model(x, training=False), reduce_retracing=True
+        )
+
+    def _build_model(self) -> keras.Model:
+        cfg = self.cfg
+        L = self.sequence_length
+
+        inputs = layers.Input(shape=(L,), dtype="int32", name="event_label_sequence")
+
+        token_emb = layers.Embedding(self.num_classes, self.d_model, name="event_embedding")(inputs)
+        # Learned positional embedding: with a short, FIXED sequence length,
+        # a learned table is simpler than sinusoidal encoding and just as
+        # effective -- there's no need to generalize beyond length L. See
+        # PositionalEmbedding's docstring for why this is a custom Layer
+        # rather than a separate Embedding(...)(tf.range(...)) call.
+        x = PositionalEmbedding(L, self.d_model, name="position_embedding")(token_emb)
+
+        for i in range(self.num_blocks):
+            attn_out = layers.MultiHeadAttention(
+                num_heads=self.num_heads, key_dim=self.d_model // self.num_heads,
+                dropout=cfg["dropout"], name=f"self_attention_{i}",
+            )(x, x)  # self-attention: query=key=value=x
+            x = layers.LayerNormalization(epsilon=1e-6, name=f"attn_norm_{i}")(x + attn_out)
+
+            ffn = keras.Sequential([
+                layers.Dense(self.d_ff, activation="relu"),
+                layers.Dense(self.d_model),
+            ], name=f"ffn_{i}")
+            ffn_out = ffn(x)
+            x = layers.LayerNormalization(epsilon=1e-6, name=f"ffn_norm_{i}")(x + ffn_out)
+
+        # Last position's contextualized representation -- it has attended
+        # over the full window and plays the same role an LSTM's final
+        # hidden state would (the target we predict is the row immediately
+        # AFTER this window, so there's no leakage in using full
+        # bidirectional attention within the window itself).
+        x = LastPositionSlice(name="last_position")(x)
+
+        for units in cfg["dense_units"]:
+            x = layers.Dense(units, activation="relu")(x)
+            x = layers.Dropout(cfg["dropout"])(x)
+
+        outputs = layers.Dense(self.num_classes, activation="softmax", name="event_softmax")(x)
+
+        model = keras.Model(inputs, outputs, name="transformer_attack_predictor")
+        loss_name = cfg.get("loss_function", "categorical_crossentropy")
+        loss = categorical_focal_loss(gamma=cfg.get("focal_gamma", 2.0)) if loss_name == "focal" else loss_name
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=cfg["learning_rate"]),
+            loss=loss,
+            metrics=["accuracy"],
+        )
+        return model
+
+    # -- Same windowing/fit/predict interface as LSTMAttackPredictor -----
+
+    def build_sliding_windows(self, event_labels: np.ndarray,
+                               target_labels: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
+        if target_labels is None:
+            target_labels = event_labels
+        L = self.sequence_length
+        n = len(event_labels) - L
+        if n <= 0:
+            raise ValueError(
+                f"Only {len(event_labels)} rows, fewer than sequence_length={L}; "
+                f"cannot build any training windows."
+            )
+        windows = np.stack([event_labels[i:i + L] for i in range(n)], axis=0).astype(np.int32)
+        targets = target_labels[L:L + n]
+        return windows, targets
+
+    def fit(self, event_labels: np.ndarray, target_labels: Optional[np.ndarray] = None,
+            class_weight: Optional[dict] = None, seed: int = 42):
+        windows, targets = self.build_sliding_windows(event_labels, target_labels)
+
+        # Same validation-representativeness fix as LSTMAttackPredictor:
+        # shuffle at the window level before Keras's contiguous-tail split.
+        rng = np.random.RandomState(seed)
+        perm = rng.permutation(len(windows))
+        windows, targets = windows[perm], targets[perm]
+
+        y_onehot = keras.utils.to_categorical(targets, num_classes=self.num_classes)
+        logger.info("Training Transformer predictor on %d label-sequence windows (seq_len=%d, num_classes=%d)",
+                    len(windows), self.sequence_length, self.num_classes)
+        history = self.model.fit(
+            windows, y_onehot,
+            batch_size=self.cfg["batch_size"],
+            epochs=self.cfg["epochs"],
+            validation_split=self.cfg["validation_split"],
+            class_weight=class_weight,
+            verbose=2,
+        )
+        return history
+
+    def predict_next_events(self, label_window: np.ndarray) -> np.ndarray:
+        x = tf.convert_to_tensor(label_window, dtype=tf.int32)
+        probs = self._infer_fn(x).numpy()
+        return np.argmax(probs, axis=-1)
+
+    def predict_proba(self, label_window: np.ndarray) -> np.ndarray:
+        x = tf.convert_to_tensor(label_window, dtype=tf.int32)
+        return self._infer_fn(x).numpy()
+
+    def predict_labels(self, event_labels: np.ndarray,
+                        target_labels: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
+        windows, targets = self.build_sliding_windows(event_labels, target_labels)
+        probs = self.model.predict(windows, verbose=0)
+        preds = np.argmax(probs, axis=-1)
+        return targets, preds
+
+    def compute_fidelity(self, event_labels: np.ndarray, target_labels: Optional[np.ndarray] = None) -> dict:
+        targets, preds = self.predict_labels(event_labels, target_labels)
+        fidelity = float(np.mean(preds == targets))
+        per_class = {}
+        for c in range(self.num_classes):
+            mask = targets == c
+            if mask.sum() > 0:
+                per_class[c] = float(np.mean(preds[mask] == c))
+        return {"fidelity": fidelity, "per_class_accuracy": per_class, "n": len(targets)}
+
+    # -- Transformer-specific: attention extraction for the Trust metric -
+
+    def get_attention_weights(self, label_window: np.ndarray, block: int = -1) -> np.ndarray:
+        """
+        Returns self-attention weights for the given batch of windows,
+        shape (batch, num_heads, seq_len, seq_len). block=-1 uses the
+        last transformer block (closest to the prediction). This is the
+        raw material for metrics.py's attention_entropy (Trust dimension)
+        and for plotting "what the model looked at" per prediction.
+
+        Layers are looked up fresh via self.model.get_layer() every call,
+        rather than using references captured at construction time -- this
+        is deliberate: after loading a saved checkpoint (predictor.model
+        gets replaced with the deserialized model), stored references from
+        the original build would still point to the randomly-initialized
+        construction-time layers, silently returning attention weights
+        from untrained weights with no error. get_layer() always reflects
+        whatever weights self.model currently holds.
+        """
+        target_idx = block if block >= 0 else self.num_blocks + block
+        x = tf.convert_to_tensor(label_window, dtype=tf.int32)
+
+        h = self.model.get_layer("event_embedding")(x)
+        h = self.model.get_layer("position_embedding")(h)
+
+        for i in range(target_idx + 1):
+            attn_layer = self.model.get_layer(f"self_attention_{i}")
+            if i < target_idx:
+                attn_out = attn_layer(h, h)
+                h = self.model.get_layer(f"attn_norm_{i}")(h + attn_out)
+                ffn_out = self.model.get_layer(f"ffn_{i}")(h)
+                h = self.model.get_layer(f"ffn_norm_{i}")(h + ffn_out)
+            else:
+                _, scores = attn_layer(h, h, return_attention_scores=True)
+                return scores.numpy()
+        raise RuntimeError("Unreachable")
 
 
 # =============================================================================

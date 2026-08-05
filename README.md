@@ -29,20 +29,24 @@ cm_mtd/
 ├── config/
 │   └── config.yaml            <- every hyperparameter, path, and TODO(paper-clarify) lives here
 ├── docs/
-│   └── SETUP.md                <- Linux Mint setup guide
+│   ├── SETUP.md                <- Linux Mint setup guide
+│   └── methodology_report.docx <- academic-style methodology writeup (architecture + Fairness/Trust/Energy eval)
 ├── data/                       <- put your .npy files here (see below)
-├── checkpoints/                <- saved LSTM/DQN/PPO models (created at runtime)
+├── checkpoints/                <- saved event_classifier/{lstm,transformer}_predictor/DQN/PPO models (created at runtime)
 ├── logs/                       <- training logs (created at runtime)
 ├── results/                     <- saved metrics + figures (created at runtime, see below)
 │   └── figures/                 <- fig7/8/9/11 PNGs + Table II JSON from generate_figures.py
 ├── scripts/
-│   ├── generate_dummy_data.py  <- smoke-test data generator (NOT for real results)
-│   └── generate_figures.py     <- renders paper-comparable figures from saved training results
+│   ├── generate_dummy_data.py       <- smoke-test data generator (NOT for real results)
+│   ├── generate_figures.py          <- renders paper-comparable figures from saved training results
+│   ├── diagnose_separability.py     <- bypasses the sequence model entirely; tests raw feature separability
+│   └── compare_architectures.py     <- trains LSTM vs Transformer on identical data, side-by-side comparison
 └── src/
     ├── __init__.py
     ├── config_parser.py        <- YAML loading, dataset loading, dim inference, class weights
     ├── environment.py          <- Gymnasium env: Waxman topology + reward Eq. 1-3 + DSR Eq. 19
-    ├── models.py                <- LSTM predictor, DQN agent, PPO agent (all TF/Keras)
+    ├── models.py                <- EventClassifier (Stage 1), LSTM/Transformer predictors (Stage 2), DQN, PPO
+    ├── metrics.py                <- Fairness / Trust / Energy evaluation (see "Evaluation dimensions" below)
     └── main.py                  <- CLI entrypoint / training loop (Algorithm 1)
 ```
 
@@ -88,7 +92,8 @@ conclusions about CM-MTD's real performance.
 ## Running it
 
 ```bash
-# 1. Pretrain the LSTM attack predictor (Section VI-A)
+# 1. Pretrain the Stage-1 classifier + Stage-2 predictor (predictor_type in config.yaml
+#    selects "transformer" (default) or "lstm")
 python3 -m src.main --config config/config.yaml --mode train_lstm
 
 # 2. Train the hierarchical DQN/PPO agents (Algorithm 1)
@@ -97,15 +102,19 @@ python3 -m src.main --config config/config.yaml --mode train_rl
 # or both in sequence:
 python3 -m src.main --config config/config.yaml --mode all
 
-# Evaluate a previously trained LSTM's fidelity (Eq. 18) without retraining:
+# Evaluate a previously trained predictor's fidelity (Eq. 18) without retraining:
 python3 -m src.main --config config/config.yaml --mode evaluate
+
+# Compare LSTM vs. Transformer head-to-head on identical data:
+python3 scripts/compare_architectures.py --config config/config.yaml
 ```
 
-All three stages were run end-to-end against dummy data as part of
-building this (LSTM trains, class weights get capped as designed, DQN/PPO
-train jointly, DSR is computed per window, checkpoints save/reload
-correctly). `config/config.yaml`'s defaults (`num_episodes: 10000`,
-`steps_per_episode: 25`) match Table I of the paper.
+All modes were run end-to-end against dummy data as part of building
+this (both predictor types train, class weights get computed as
+designed, DQN/PPO train jointly, DSR is computed per window, checkpoints
+save/reload correctly for either architecture). `config/config.yaml`'s
+defaults (`num_episodes: 10000`, `steps_per_episode: 25`) match Table I
+of the paper.
 
 **Expect roughly half a day for a full run on CPU** (~14 hours measured
 at real config scale in testing; a GPU or faster CPU will do better).
@@ -169,8 +178,11 @@ they don't get lost if you screenshot one in isolation:
 
 | Component | File | Paper reference |
 |---|---|---|
-| LSTM attack predictor | `models.py::LSTMAttackPredictor` | Section VI-A, Eq. 11-12, Fig. 4 |
-| Prediction fidelity | `models.py::compute_fidelity` | Eq. 18 |
+| Stage 1: event classifier | `models.py::EventClassifier` | Section IV's "detection logs" (Random Forest, not in the paper — see below) |
+| Stage 2: LSTM attack predictor | `models.py::LSTMAttackPredictor` | Section VI-A, Eq. 11-12, Fig. 4 |
+| Stage 2: Transformer attack predictor (default) | `models.py::TransformerAttackPredictor` | Not in the paper — see "Stage 2 architecture choice" below |
+| Fairness / Trust / Energy evaluation | `metrics.py` | Not in the paper — see "Evaluation dimensions" below |
+| Prediction fidelity | `LSTMAttackPredictor.compute_fidelity` | Eq. 18 |
 | Waxman topology | `environment.py::build_waxman_topology` | Section III-A, Table I |
 | SMDP state / reward | `environment.py::DigitalTwinNetworkEnv` | Section III-C, Eq. 1-3 |
 | LSTM state wrapper | `environment.py::LSTMStatePredictionWrapper` | Fig. 5 (Env → LSTM → state) |
@@ -178,6 +190,112 @@ they don't get lost if you screenshot one in isolation:
 | Upper-layer DQN | `models.py::DQNAgent` | Section VI-B, Eq. 13-14 |
 | Lower-layer PPO | `models.py::PPOAgent` | Section VI-B, Eq. 15-17 |
 | Training loop | `main.py::train_rl` | Algorithm 1 |
+
+---
+
+## Why there are two stages now, not one LSTM
+
+An earlier version fed raw per-row CICIDS-2017 features directly into the
+LSTM as a sliding window, reasoning that richer input would help the
+model learn. In practice this collapsed to predicting the majority class
+no matter how the loss function or class weighting was tuned (several
+rounds of debugging are recorded in "Known failure modes" below).
+`scripts/diagnose_separability.py` settled the question: a plain Random
+Forest gets **~100% recall on both Benign and DoS/DDoS directly from the
+raw features** — the features were never the problem. Flow-level rows in
+CICIDS-2017 don't have strong row-to-row temporal coherence the way a
+genuine per-node event log would, so treating a window of raw feature
+vectors as a time series was the wrong framing.
+
+The paper's own Section IV and Eq. 12 actually describe a two-stage
+design already: "security events are generated from the detection logs
+of network nodes... these security events will be taken as input of
+LSTM" — i.e. the LSTM's input is already-*classified* discrete events,
+not raw continuous features. This project now matches that:
+
+1. **`EventClassifier`** (Random Forest, not specified by the paper — a
+   stand-in for "existing IDS/firewall detection logs") turns each row's
+   raw features into a classified event label.
+2. **`LSTMAttackPredictor`** predicts the *next* label from the recent
+   *sequence of labels* Stage 1 produced — a much smaller, genuinely
+   sequential problem (closer to a Markov chain over event types) than
+   windowed regression over noisy high-dimensional features. Validated
+   on synthetic data matching the diagnostic's separability + genuine
+   temporal burst clustering: 99.3% fidelity with 96%+ accuracy on both
+   classes simultaneously, vs. the single-LSTM design's persistent
+   collapse to one class or the other on the same kind of data.
+
+Stage 2 trains on Stage 1's *own predictions* (not ground truth) as
+input, so what it learns from at train time matches what it will
+actually see at inference/deployment time — but the target it predicts
+is still the real ground-truth label, so it's learning to forecast
+genuine future events, not just extrapolate Stage 1's mistakes.
+
+---
+
+## Stage 2 architecture choice: LSTM vs. Transformer
+
+`config.predictor_type` ("transformer" | "lstm") selects which sequence
+model Stage 2 uses; both share the exact same interface
+(`fit`/`predict_next_events`/`predict_proba`/`compute_fidelity`), so
+switching is a one-line config change. `docs/methodology_report.docx`
+has the full academic-style writeup (architecture spec, justification,
+evaluation protocol); the short version:
+
+- **Predictive performance is tied.** On matched synthetic validation
+  data, fidelity and class-fairness were statistically identical between
+  the two architectures — this is a "no regression" result, not a
+  predictive win for the Transformer.
+- **The Transformer is *not* faster here — an honest negative result.**
+  The initial justification assumed attention's parallelizability would
+  train faster than the LSTM's recurrence. Measured head-to-head
+  (`scripts/compare_architectures.py`, CPU, seq_len=10), it took
+  ~1.7–2x *longer* to train and used more estimated energy. Self-
+  attention's O(L²) cost outweighs recurrence's O(L) cost at this short
+  a sequence length — the parallelization advantage is real but needs
+  longer sequences and/or GPU execution to show up, neither of which
+  apply to this specific forecasting task. This is reported plainly in
+  the methodology report rather than omitted.
+- **The actual reason to prefer it: interpretability.** Self-attention
+  weights are a directly inspectable record of which recent events drove
+  a given prediction — `TransformerAttackPredictor.get_attention_weights()`
+  — something the LSTM's opaque hidden state doesn't offer without a
+  separate post-hoc method (SHAP/LIME) bolted on. This is the basis for
+  the attention-entropy Trust metric below.
+
+Run the comparison yourself:
+
+```bash
+python3 scripts/compare_architectures.py --config config/config.yaml
+```
+
+This trains both architectures on identical data (same Stage-1
+classifier, split, class weights, seed) and prints/saves a side-by-side
+table to `results/architecture_comparison.json`.
+
+---
+
+## Evaluation dimensions: Fairness, Trust, Energy
+
+Beyond the paper's own fidelity metric (Eq. 18), `src/metrics.py`
+computes three further dimensions, run automatically during
+`--mode train_lstm` / `--mode all` and saved to
+`results/evaluation_report_<predictor_type>.json`. None of these are
+bespoke — each adapts a standard, citable technique (see the methodology
+report's References section) to what's actually measurable here:
+
+| Dimension | What's measured | Function |
+|---|---|---|
+| **Fairness** (class) | Does the predictor sacrifice minority-class recall for majority-class accuracy? Recall gap + equity ratio across Benign/DoS-DDoS/Infiltration | `metrics.class_fairness` |
+| **Fairness** (node) | Does the MTD policy protect all network nodes roughly equally? Coefficient of variation + Jain's fairness index over per-node DSR | `metrics.node_fairness` |
+| **Trust** (calibration) | Does predicted confidence match actual accuracy? Expected Calibration Error (Guo et al., 2017) | `metrics.expected_calibration_error` |
+| **Trust** (interpretability) | How concentrated is the Transformer's attention over recent history? Normalized entropy (Transformer only) | `metrics.attention_entropy` |
+| **Trust** (stability) | Does a semantically-neutral perturbation (swapping adjacent Benign labels) flip the prediction? | `metrics.prediction_stability` |
+| **Energy** | Training energy (CodeCarbon, with a labeled wall-clock fallback), training time, inference latency, parameter count | `metrics.track_energy`, `metrics.benchmark_inference_latency` |
+
+Toggle any of these off in `config.evaluation` if you don't need them
+for a given run (they add some training-time overhead, mostly from
+CodeCarbon's tracking).
 
 ---
 
