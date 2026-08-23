@@ -1,0 +1,23 @@
+{
+    "dataset": "5G-NIDD",
+    "preprocessing_logic": "Chronological split, leaked-free scaled, for DRL states",
+    "original_samples": 1215890,
+    "cleaned_samples": 1215889,
+    "features_before_selection": 51,
+    "features_after_selection": 28,
+    "train_samples": 972711,
+    "val_samples": 121589,
+    "test_samples": 121589,
+    "scaler": "MinMaxScaler",
+    "correlation_threshold": 0.9,
+    "use_resampling": false,
+    "sequence_mode": true,
+    "sequence_length": 10,
+    "stride": 1,
+    "random_seed": 42,
+    "class_mapping": {
+        "0": "Benign",
+        "1": "Scan/Infiltration",
+        "2": "DDoS"
+    }
+}
