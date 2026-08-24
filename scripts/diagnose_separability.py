@@ -1,23 +1,26 @@
 """
 diagnose_separability.py
 -------------------------
-Standalone diagnostic, independent of the LSTM/sliding-window/RL
+Standalone diagnostic, independent of the sequence-model/windowing/RL
 pipeline entirely. Trains a plain scikit-learn classifier directly on
-your real X_train_env_state.npy / y_train_env_state.npy rows (no
-sequences, no windowing, no class-weight tuning beyond sklearn's
-built-in 'balanced' option) to answer one question: are your actual
-preprocessed features separable at all?
+your real preprocessed X_train/y_train rows for whichever dataset
+config.experiment.dataset names (no sequences, no windowing, no
+class-weight tuning beyond sklearn's built-in 'balanced' option) to
+answer one question: are your actual preprocessed features separable at
+all?
 
-This exists because repeated attempts to fix the LSTM's majority-class
-collapse via loss function / class-weight tuning were not resolving it
-in synthetic reproductions, which means the LSTM/windowing pipeline
-itself needs to be ruled in or out as the culprit before tuning it
-further. If THIS script also fails to separate the classes, the issue
-is upstream (features/preprocessing), not the LSTM. If this succeeds
-comfortably, the issue is specific to the sequence/LSTM pipeline.
+This exists because repeated attempts to fix an earlier single-LSTM
+design's majority-class collapse via loss function / class-weight tuning
+were not resolving it in synthetic reproductions, which means the
+sequence-model/windowing pipeline itself needs to be ruled in or out as
+the culprit before tuning it further. If THIS script also fails to
+separate the classes, the issue is upstream (features/preprocessing), not
+the sequence model. If this succeeds comfortably, the issue is specific
+to the sequence/windowing pipeline.
 
 Usage:
     python3 scripts/diagnose_separability.py --config config/config.yaml
+    python3 scripts/diagnose_separability.py --config config/config.yaml --dataset 5g_nidd
 """
 
 import argparse
@@ -25,7 +28,6 @@ import sys
 import os
 
 import numpy as np
-import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -33,25 +35,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config/config.yaml")
+    parser.add_argument("--dataset", type=str, default=None, choices=["cicids2017", "5g_nidd"],
+                         help="Override config.experiment.dataset without editing config.yaml.")
     parser.add_argument("--max-rows", type=int, default=300000,
                          help="Subsample this many rows for speed (RandomForest on millions of rows is slow).")
     args = parser.parse_args()
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    from src.config_parser import load_config, apply_cli_overrides, load_dataset
+
+    cfg = load_config(args.config)
+    cfg = apply_cli_overrides(cfg, dataset=args.dataset)
 
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import classification_report, confusion_matrix
 
-    data_cfg = cfg["data"]
-    class_names = data_cfg["class_names"]
+    print(f"Loading dataset {cfg['experiment']['dataset']!r} via its adapter "
+          f"(bypasses windowing/sequence-model entirely -- raw rows only)...")
+    dataset = load_dataset(cfg)
+    class_names = dataset.class_names
 
-    print("Loading data (this bypasses windowing/LSTM entirely -- raw rows only)...")
-    X_train = np.load(data_cfg["x_train_path"])
-    y_train = np.load(data_cfg["y_train_path"]).reshape(-1)
-    X_test = np.load(data_cfg["x_test_path"])
-    y_test = np.load(data_cfg["y_test_path"]).reshape(-1)
+    X_train, y_train = dataset.X_train, dataset.y_train
+    X_test, y_test = dataset.X_test, dataset.y_test
 
     print(f"X_train: {X_train.shape}, y_train classes: {dict(zip(*np.unique(y_train, return_counts=True)))}")
     print(f"X_test:  {X_test.shape}, y_test classes:  {dict(zip(*np.unique(y_test, return_counts=True)))}")
@@ -83,12 +88,12 @@ def main():
 
     print("\n=== Interpretation ===")
     print("If both baselines get meaningfully above the majority-class rate")
-    print("with real recall on DoS/DDoS (not 0%, not collapsed the other way),")
-    print("your features ARE separable -- the problem is specific to the")
-    print("LSTM/sliding-window pipeline, not the underlying data.")
+    print("with real recall on the minority classes (not 0%, not collapsed the")
+    print("other way), your features ARE separable -- the problem is specific to")
+    print("the sequence-model/windowing pipeline, not the underlying data.")
     print("If these ALSO collapse or perform near-randomly, the issue is")
-    print("upstream: likely the feature selection/preprocessing in")
-    print("cicids2017.ipynb (e.g. the correlation-pruning step may have")
+    print("upstream: likely the feature selection/preprocessing in the relevant")
+    print("preprocessing notebook (e.g. the correlation-pruning step may have")
     print("dropped the most discriminative features).")
 
 

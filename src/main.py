@@ -2,16 +2,28 @@
 main.py
 -------
 Entry point for the CM-MTD pipeline. Orchestrates:
-  1. Loading config + dataset (dataset-agnostic; shapes inferred at runtime)
-  2. Pretraining the LSTM attack predictor (Section VI-A)
+  1. Loading config + dataset (dataset-agnostic; shapes inferred at
+     runtime via src/datasets/'s adapter registry)
+  2. Pretraining the Stage-2 attack predictor (LSTM or Transformer,
+     Section VI-A)
   3. Running the hierarchical DQN/PPO training loop (Algorithm 1)
   4. Evaluation: prediction fidelity (Eq. 18) and Defense Success Ratio (Eq. 19)
+
+experiment.dataset ("cicids2017" | "5g_nidd") and experiment.predictor
+("transformer" | "lstm") are the pipeline's two independent experimental
+variables -- override either from config.yaml or the CLI flags below.
+Checkpoints/results are namespaced by both (see
+config_parser.get_run_paths) so switching one doesn't clobber the other's
+outputs.
 
 Usage:
     python -m src.main --config config/config.yaml --mode all
     python -m src.main --config config/config.yaml --mode train_lstm
     python -m src.main --config config/config.yaml --mode train_rl
     python -m src.main --config config/config.yaml --mode evaluate
+
+    # Override the config file's dataset/predictor without editing it:
+    python -m src.main --config config/config.yaml --mode all --dataset 5g_nidd --predictor lstm
 """
 
 from __future__ import annotations
@@ -26,7 +38,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config_parser import (
-    load_config, set_global_seed, load_dataset, compute_class_weights,
+    load_config, apply_cli_overrides, active_dataset_cfg, active_predictor_cfg,
+    get_run_paths, set_global_seed, load_dataset, compute_class_weights,
     configure_device, reset_tf_session, setup_logging,
 )
 from src.environment import (
@@ -42,15 +55,15 @@ def _build_predictor(predictor_type: str, num_classes: int, cfg: dict):
     elif predictor_type == "lstm":
         return LSTMAttackPredictor(num_classes, cfg["lstm"])
     else:
-        raise ValueError(f"Unknown predictor_type: {predictor_type!r} (expected 'transformer' or 'lstm')")
+        raise ValueError(f"Unknown predictor {predictor_type!r} (expected 'transformer' or 'lstm')")
 
 
-def train_attack_predictor(cfg: dict, dataset, logger):
+def train_attack_predictor(cfg: dict, dataset, run_paths: dict, logger):
     """
     Trains the full two-stage attack predictor:
       Stage 1 (EventClassifier): raw features -> classified event label.
       Stage 2 (LSTMAttackPredictor or TransformerAttackPredictor, per
-        config.predictor_type): recent label history -> next label.
+        config.experiment.predictor): recent label history -> next label.
     Also computes Fairness/Trust/Energy metrics (src/metrics.py) alongside
     the paper's own fidelity (Eq. 18) evaluation, per config.evaluation.
     See models.py's EventClassifier / TransformerAttackPredictor
@@ -58,8 +71,8 @@ def train_attack_predictor(cfg: dict, dataset, logger):
     raw feature sequences.
     """
     reset_tf_session()
-    predictor_type = cfg.get("predictor_type", "transformer")
-    stage2_cfg = cfg[predictor_type]
+    predictor_type = cfg["experiment"]["predictor"]
+    stage2_cfg = active_predictor_cfg(cfg)
 
     # --- Stage 1: classify every row from its raw features -------------
     clf_cfg = cfg["event_classifier"]
@@ -105,9 +118,13 @@ def train_attack_predictor(cfg: dict, dataset, logger):
         name = dataset.class_names[c] if c < len(dataset.class_names) else str(c)
         logger.info("  per-class accuracy [%s]: %.4f", name, acc)
 
-    results_dir = cfg["experiment"]["results_dir"]
+    results_dir = run_paths["results_dir"]
     os.makedirs(results_dir, exist_ok=True)
-    eval_report = {"predictor_type": predictor_type, "fidelity": fidelity_metrics["fidelity"]}
+    eval_report = {
+        "dataset": cfg["experiment"]["dataset"],
+        "predictor_type": predictor_type,
+        "fidelity": fidelity_metrics["fidelity"],
+    }
 
     # --- Fairness ---------------------------------------------------------
     if eval_cfg.get("compute_fairness", True):
@@ -180,7 +197,7 @@ def train_attack_predictor(cfg: dict, dataset, logger):
     )
     logger.info("Saved training history + confusion data to %s/", results_dir)
 
-    ckpt_dir = cfg["experiment"]["checkpoint_dir"]
+    ckpt_dir = run_paths["checkpoint_dir"]
     os.makedirs(ckpt_dir, exist_ok=True)
     classifier.save(os.path.join(ckpt_dir, "event_classifier.joblib"))
     predictor.model.save(os.path.join(ckpt_dir, f"{predictor_type}_predictor.keras"))
@@ -188,14 +205,15 @@ def train_attack_predictor(cfg: dict, dataset, logger):
     return classifier, predictor
 
 
-def train_rl(cfg: dict, dataset, classifier, predictor, logger):
+def train_rl(cfg: dict, dataset, classifier, predictor, run_paths: dict, logger):
     seed = cfg["experiment"]["seed"]
     net_cfg = cfg["network"]
     reward_cfg = cfg["reward"]
+    dataset_cfg = active_dataset_cfg(cfg)
 
-    base_env = DigitalTwinNetworkEnv(dataset, net_cfg, reward_cfg, cfg["data"], seed=seed)
-    predictor_type = cfg.get("predictor_type", "transformer")
-    seq_len = cfg[predictor_type]["sequence_length"]
+    base_env = DigitalTwinNetworkEnv(dataset, net_cfg, reward_cfg, dataset_cfg, seed=seed)
+    predictor_type = cfg["experiment"]["predictor"]
+    seq_len = active_predictor_cfg(cfg)["sequence_length"]
     env = AttackPredictionStateWrapper(base_env, classifier, predictor, seq_len)
 
     state_dim = base_env.n_nodes
@@ -210,7 +228,7 @@ def train_rl(cfg: dict, dataset, classifier, predictor, logger):
     K = cfg["ppo"]["steps_per_macro_action"]
     eval_every = cfg["training"]["eval_every_episodes"]
     save_every = cfg["training"]["save_every_episodes"]
-    ckpt_dir = cfg["experiment"]["checkpoint_dir"]
+    ckpt_dir = run_paths["checkpoint_dir"]
     os.makedirs(ckpt_dir, exist_ok=True)
 
     upper_rewards_log, lower_rewards_log, dsr_log = [], [], []
@@ -287,7 +305,7 @@ def train_rl(cfg: dict, dataset, classifier, predictor, logger):
             ppo.critic.save(os.path.join(ckpt_dir, f"ppo_critic_ep{episode}.keras"))
             logger.info("Saved RL checkpoints at episode %d", episode)
 
-    results_dir = cfg["experiment"]["results_dir"]
+    results_dir = run_paths["results_dir"]
     os.makedirs(results_dir, exist_ok=True)
     dsr_episodes = np.array([e for e, _ in dsr_log])
     dsr_values = np.array([d for _, d in dsr_log])
@@ -312,12 +330,23 @@ def main():
     parser.add_argument("--config", type=str, default="config/config.yaml")
     parser.add_argument("--mode", type=str, default="all",
                          choices=["train_lstm", "train_rl", "all", "evaluate"])
+    parser.add_argument("--dataset", type=str, default=None, choices=["cicids2017", "5g_nidd"],
+                         help="Override config.experiment.dataset without editing config.yaml.")
+    parser.add_argument("--predictor", type=str, default=None, choices=["transformer", "lstm"],
+                         help="Override config.experiment.predictor without editing config.yaml.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    logger = setup_logging(cfg["experiment"]["log_dir"])
+    cfg = apply_cli_overrides(cfg, dataset=args.dataset, predictor=args.predictor)
+    run_paths = get_run_paths(cfg)
+
+    logger = setup_logging(run_paths["log_dir"])
     set_global_seed(cfg["experiment"]["seed"])
     configure_device(cfg["experiment"]["device"])
+
+    logger.info("Run: dataset=%s predictor=%s (checkpoints -> %s, results -> %s)",
+                cfg["experiment"]["dataset"], cfg["experiment"]["predictor"],
+                run_paths["checkpoint_dir"], run_paths["results_dir"])
 
     logger.info("Loading dataset...")
     dataset = load_dataset(cfg)
@@ -326,19 +355,20 @@ def main():
 
     predictor = None
     classifier = None
-    predictor_type = cfg.get("predictor_type", "transformer")
-    ckpt_dir = cfg["experiment"]["checkpoint_dir"]
+    predictor_type = cfg["experiment"]["predictor"]
+    ckpt_dir = run_paths["checkpoint_dir"]
     predictor_ckpt_path = os.path.join(ckpt_dir, f"{predictor_type}_predictor.keras")
     classifier_ckpt_path = os.path.join(ckpt_dir, "event_classifier.joblib")
 
     if args.mode in ("train_lstm", "all"):
-        classifier, predictor = train_attack_predictor(cfg, dataset, logger)
+        classifier, predictor = train_attack_predictor(cfg, dataset, run_paths, logger)
     else:
         import tensorflow as tf
         if not (os.path.exists(predictor_ckpt_path) and os.path.exists(classifier_ckpt_path)):
             raise FileNotFoundError(
                 f"No checkpoint found at {predictor_ckpt_path} / {classifier_ckpt_path}. "
-                f"Run --mode train_lstm first (with predictor_type={predictor_type!r} in config.yaml)."
+                f"Run --mode train_lstm first (with dataset={cfg['experiment']['dataset']!r}, "
+                f"predictor={predictor_type!r})."
             )
         logger.info("Loading Stage-1 classifier from %s", classifier_ckpt_path)
         classifier = EventClassifier()
@@ -356,7 +386,7 @@ def main():
         )
 
     if args.mode in ("train_rl", "all"):
-        results = train_rl(cfg, dataset, classifier, predictor, logger)
+        results = train_rl(cfg, dataset, classifier, predictor, run_paths, logger)
         final_dsr = results["base_env"].stats.dsr()
         logger.info("Training complete. Final-window DSR (Eq. 19): %.3f", final_dsr)
 

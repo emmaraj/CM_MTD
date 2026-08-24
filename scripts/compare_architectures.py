@@ -7,8 +7,13 @@ random seed) and produces a side-by-side comparison across predictive
 performance, fairness, trust, and energy -- the evidence base for the
 methodology report's architecture-comparison section.
 
+Runs against whichever dataset config.experiment.dataset names (override
+with --dataset) -- experiment.predictor is ignored here since the whole
+point of this script is to run both predictors in the same pass.
+
 Usage:
     python3 scripts/compare_architectures.py --config config/config.yaml
+    python3 scripts/compare_architectures.py --config config/config.yaml --dataset 5g_nidd
     python3 scripts/compare_architectures.py --config config/config.yaml --output results/comparison.json
 """
 
@@ -20,7 +25,6 @@ import os
 import sys
 
 import numpy as np
-import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -116,21 +120,25 @@ def print_comparison_table(results: dict) -> None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config/config.yaml")
+    parser.add_argument("--dataset", type=str, default=None, choices=["cicids2017", "5g_nidd"],
+                         help="Override config.experiment.dataset without editing config.yaml.")
     parser.add_argument("--output", type=str, default=None,
-                         help="Where to save the JSON comparison (default: results/<results_dir>/architecture_comparison.json)")
+                         help="Where to save the JSON comparison "
+                              "(default: results/<dataset>/architecture_comparison.json)")
     args = parser.parse_args()
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    from src.config_parser import load_dataset, apply_cli_overrides, set_global_seed, configure_device, setup_logging, load_config
 
-    from src.config_parser import load_dataset, set_global_seed, configure_device, setup_logging
+    cfg = load_config(args.config)
+    cfg = apply_cli_overrides(cfg, dataset=args.dataset)
+    dataset_name = cfg["experiment"]["dataset"]
 
     logger = setup_logging(cfg["experiment"]["log_dir"])
     set_global_seed(cfg["experiment"]["seed"])
     configure_device(cfg["experiment"]["device"])
     dataset = load_dataset(cfg)
-    logger.info("Comparing LSTM vs Transformer on identical data (input_dim=%d, num_classes=%d)",
-                dataset.input_dim, dataset.num_classes)
+    logger.info("Comparing LSTM vs Transformer on %s (input_dim=%d, num_classes=%d)",
+                dataset_name, dataset.input_dim, dataset.num_classes)
 
     results = {
         "lstm": run_one(cfg, dataset, "lstm", logger),
@@ -139,7 +147,8 @@ def main():
 
     print_comparison_table(results)
 
-    out_path = args.output or os.path.join(cfg["experiment"]["results_dir"], "architecture_comparison.json")
+    out_path = args.output or os.path.join(cfg["experiment"]["results_dir"], dataset_name,
+                                            "architecture_comparison.json")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2, default=float)

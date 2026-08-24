@@ -42,8 +42,8 @@ def categorical_focal_loss(gamma: float = 2.0):
     A static class_weight multiplier applies the SAME fixed factor to
     every example of a class for the entire training run. Empirically on
     this project that produced a narrow, unstable corridor: a mild weight
-    (~2.4x DoS/DDoS:Benign) collapsed to always-predict-Benign, a stronger
-    one (~6x) overcorrected to mostly-predict-DoS/DDoS, and there was no
+    collapsed to always-predict-majority-class, a stronger one
+    overcorrected to mostly-predict-minority-class, and there was no
     value in between that gave genuine learning -- two collapse modes,
     no stable middle ground.
 
@@ -83,18 +83,17 @@ class EventClassifier:
     by existing IDS/firewall/NetFlow tooling; here it's a Random Forest.
 
     This exists because an earlier design fed raw per-row features
-    directly into the LSTM's sliding window (reasoning: richer input
-    should help). scripts/diagnose_separability.py proved that backwards:
-    a plain Random Forest gets ~100% recall on Benign/DoS-DDoS directly
-    from these features, while the identical features framed as an LSTM
-    sequence collapsed to a majority-class predictor no matter how the
+    directly into the sequence model's sliding window (reasoning: richer
+    input should help). scripts/diagnose_separability.py proved that
+    backwards: a plain Random Forest gets very high recall directly from
+    these features, while the identical features framed as a sequence
+    collapsed to a majority-class predictor no matter how the
     loss/class-weighting was tuned. The features were never the problem;
     treating flow-level rows (no inherent row-to-row temporal coherence)
     as a time series was. This classifier does the part the data is
     actually good for -- per-row classification -- and hands its output
-    to LSTMAttackPredictor (Stage 2) below, which does the part that's
-    genuinely sequential: predicting the next label from recent label
-    history.
+    to Stage 2 below, which does the part that's genuinely sequential:
+    predicting the next label from recent label history.
 
     input_dim/num_classes are inferred from the data, never hardcoded.
     """

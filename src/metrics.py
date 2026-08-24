@@ -31,7 +31,7 @@ logger = logging.getLogger("cm_mtd")
 # There's no demographic attribute in network traffic, so "fairness" here
 # is adapted to the two groupings that actually matter for this system:
 #   (a) traffic CLASSES -- does the predictor perform equitably across
-#       Benign/DoS-DDoS/Infiltration, or does it sacrifice minority-class
+#       Benign/Scan-Infiltration/DDoS, or does it sacrifice minority-class
 #       performance for majority-class accuracy? (this was the central
 #       failure mode debugged throughout this project, so it's a directly
 #       meaningful axis here, not a stretch)
@@ -50,7 +50,7 @@ def class_fairness(per_class_recall: dict) -> dict:
       recall_gap: max - min (0 = perfectly equitable; closer to 1 = one
         class is being sacrificed for another -- this is exactly the
         gap that was ~1.0 during this project's majority-class-collapse
-        failures, e.g. Benign=1.00 vs DoS/DDoS=0.00).
+        failures, e.g. Benign=1.00 vs DDoS=0.00).
       equity_ratio: min / max (1 = perfectly equitable; 0 = total
         neglect of the worst-served class). Undefined (returned as None)
         if max_recall is 0.

@@ -7,10 +7,11 @@ Network (DTMN) from Zhang et al. (IEEE JSAC 2023), Sections III & V.
 Design notes (read before modifying reward logic):
 
 * The environment NEVER calls np.random inside step(). Which row of the
-  empirical CICIDS-2017 trace is "observed" by each node at each timestep
-  is a deterministic function of the timestep and node index (round-robin
-  over the dataset). This satisfies the "strictly step through empirical
-  data traces, no synthetic/randomized states" requirement.
+  empirical dataset trace (CICIDS-2017 or 5G-NIDD -- see src/datasets/)
+  is "observed" by each node at each timestep is a deterministic function
+  of the timestep and node index (round-robin over the dataset). This
+  satisfies the "strictly step through empirical data traces, no
+  synthetic/randomized states" requirement.
 
 * "Attacker targeting" (which IP pool / route the adversary is aiming at)
   is derived deterministically from each sample's own feature vector via a
@@ -29,6 +30,21 @@ Design notes (read before modifying reward logic):
   are drawn from precomputed simple paths between each flow's fixed
   source/destination switch, and IP pool indices are bounded categorical
   choices. This is a deliberate simplification, not a paper ambiguity.
+
+* HAM/RM defense logic below resolves which security-event class is
+  "reconnaissance-type" (what HAM defends against) and which is
+  "flooding-type" (what RM defends against) via
+  `dataset.reconnaissance_class` / `dataset.flooding_class`
+  (src/datasets/base.py::DatasetBundle) rather than hardcoded class-name
+  string literals. This class previously looked up literal strings
+  ("Infiltration", "DoS/DDoS") directly in `dataset.class_names`, which
+  broke the moment a dataset's preprocessing notebook used different
+  label text for the same semantic archetype (e.g. CICIDS-2017 and
+  5G-NIDD's current notebooks both collapse their raw labels down to
+  "Scan/Infiltration" / "DDoS", not "Infiltration" / "DoS/DDoS"). Label
+  taxonomy is a modeling decision the DATASET ADAPTER must make
+  explicitly (see src/datasets/cicids2017.py, src/datasets/nidd5g.py),
+  not something this file should assume or silently fail on.
 """
 
 from __future__ import annotations
@@ -92,7 +108,7 @@ def build_waxman_topology(num_nodes: int, alpha: float, beta: float, seed: int) 
     return graph
 
 
-def build_flow_routes(graph: nx.Graph, num_flows: int, num_candidates: int, seed: int) -> list[list[list[int]]]:
+def build_flow_routes(graph: nx.Graph, num_flows: int, num_candidates: int, seed: int) -> list:
     """
     For each of `num_flows` flows, pick a fixed (source, destination) pair
     of switches and precompute up to `num_candidates` simple paths between
@@ -101,7 +117,7 @@ def build_flow_routes(graph: nx.Graph, num_flows: int, num_candidates: int, seed
     """
     rng = np.random.RandomState(seed)
     nodes = list(graph.nodes())
-    routes: list[list[list[int]]] = []
+    routes: list = []
 
     attempts = 0
     while len(routes) < num_flows and attempts < num_flows * 50:
@@ -163,18 +179,22 @@ class DigitalTwinNetworkEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, dataset, network_cfg: dict, reward_cfg: dict, data_cfg: dict, seed: int = 42):
+    def __init__(self, dataset, network_cfg: dict, reward_cfg: dict, dataset_cfg: dict, seed: int = 42):
         super().__init__()
         self.dataset = dataset
 
         # This environment's own bounded, row-cycling view of the training
         # data -- built here (not in config_parser.load_dataset) so that
-        # LSTM training elsewhere always sees the full, genuinely-
-        # contiguous dataset. See config_parser.build_env_row_cache's
+        # Stage-2 sequence-model training elsewhere always sees the full,
+        # genuinely-contiguous dataset. See config_parser.build_env_row_cache's
         # docstring for why sharing one truncated/reordered view between
-        # both consumers was a bug.
+        # both consumers was a bug. `dataset_cfg` is this dataset's own
+        # config.datasets.<name> block (config_parser.active_dataset_cfg),
+        # which is where max_samples/truncation_strategy now live (they're
+        # per-dataset settings, not a single shared `data:` block, since
+        # different datasets have very different sizes/imbalance profiles).
         from src.config_parser import build_env_row_cache
-        self._env_X_train, self._env_y_train = build_env_row_cache(dataset, data_cfg)
+        self._env_X_train, self._env_y_train = build_env_row_cache(dataset, dataset_cfg)
 
         self.n_nodes = network_cfg["num_nodes"]
         self.num_ip_pools = network_cfg["num_ip_pools"]
@@ -193,41 +213,19 @@ class DigitalTwinNetworkEnv(gym.Env):
         # the purpose of "which node is this DDoS event targeting".
         self._flow_dest_node = [i % self.n_nodes for i in range(self.num_flows)]
 
-        try:
-            self._infiltration_class = dataset.class_names.index("Infiltration")
-        except ValueError:
-            raise RuntimeError(
-                "environment.py requires a class literally named 'Infiltration' in "
-                "config.data.class_names to know which security-event label HAM "
-                f"defends against, but it's not there. Current class_names: "
-                f"{dataset.class_names} (num_classes inferred from data: {dataset.num_classes}).\n\n"
-                "This almost always means config.data.class_names doesn't match the "
-                "actual number of distinct labels in your .npy files -- "
-                "config_parser.Dataset silently falls back to generic 'class_N' names "
-                "on a count mismatch, which is what just happened. Check what's "
-                "actually in your files:\n"
-                "    python3 -c \"import numpy as np; y=np.load('<your y_train path>'); "
-                "print(np.unique(y, return_counts=True))\"\n"
-                "and confirm the count matches config.data.class_names. A common cause "
-                "is x_train_path/y_train_path still pointing at .npy files from an "
-                "earlier/different preprocessing run.\n\n"
-                "If you're intentionally using a dataset without an Infiltration-style "
-                "reconnaissance class, the reward model in this file needs to be "
-                "adapted deliberately (see the HAM/RM defense logic below) rather than "
-                "silently running with it disabled."
-            )
-        try:
-            self._ddos_class = dataset.class_names.index("DoS/DDoS")
-        except ValueError:
-            raise RuntimeError(
-                "environment.py requires a class literally named 'DoS/DDoS' in "
-                "config.data.class_names to know which security-event label RM "
-                f"defends against, but it's not there. Current class_names: "
-                f"{dataset.class_names} (num_classes inferred from data: {dataset.num_classes}).\n\n"
-                "See the 'Infiltration' error above for the likely cause (a class-count "
-                "mismatch between config.data.class_names and your actual .npy files) "
-                "and how to check it."
-            )
+        # Semantic roles, resolved by the dataset's adapter (see this
+        # module's docstring) -- NOT hardcoded string lookups here.
+        # DatasetBundle.__post_init__ already validated at load time that
+        # these names are genuinely present in dataset.class_names, so no
+        # further defensive checking is needed at this call site.
+        self._reconnaissance_class = dataset.reconnaissance_class
+        self._flooding_class = dataset.flooding_class
+        logger.info(
+            "HAM defends against reconnaissance_class=%r (id=%d); RM defends against "
+            "flooding_class=%r (id=%d)",
+            dataset.reconnaissance_class_name, self._reconnaissance_class,
+            dataset.flooding_class_name, self._flooding_class,
+        )
 
         self.action_space = spaces.Dict({
             "macro": spaces.Discrete(NUM_MACRO_ACTIONS),
@@ -281,11 +279,11 @@ class DigitalTwinNetworkEnv(gym.Env):
 
         scans_this_step = 0
         compromised_switches_this_step = 0
-        compromised_switch_ids: set[int] = set()
+        compromised_switch_ids: set = set()
 
-        # --- HAM vs. reconnaissance (Infiltration) events, per node -----
+        # --- HAM vs. reconnaissance-type events, per node ----------------
         for i in range(self.n_nodes):
-            if raw_events[i] == self._infiltration_class:
+            if raw_events[i] == self._reconnaissance_class:
                 self.stats.scanned_nodes_total += 1
                 attacker_target = _deterministic_target_index(features[i], self.num_ip_pools)
                 defended = ham_active and (ip_assignment[i] != attacker_target)
@@ -293,10 +291,10 @@ class DigitalTwinNetworkEnv(gym.Env):
                     scans_this_step += 1
                     self.stats.scan_successes_total += 1
 
-        # --- RM vs. DDoS events, per flow's destination node -------------
+        # --- RM vs. flooding-type events, per flow's destination node ----
         for f in range(self.num_flows):
             dest_node = self._flow_dest_node[f]
-            if raw_events[dest_node] == self._ddos_class:
+            if raw_events[dest_node] == self._flooding_class:
                 candidates = self.flow_routes[f]
                 chosen_idx = int(route_assignment[f]) % len(candidates)
                 route = candidates[chosen_idx]
@@ -369,7 +367,7 @@ class AttackPredictionStateWrapper(gym.Wrapper):
     Works with either LSTMAttackPredictor or TransformerAttackPredictor
     (models.py) interchangeably -- both share the same
     predict_next_events(label_window) interface, so swapping
-    config.predictor_type doesn't require touching this wrapper.
+    config.experiment.predictor doesn't require touching this wrapper.
 
     Fig. 5's flowchart is: Environment --observations--> LSTM --state-->
     DQN/PPO. Concretely that arrow is now two hops: raw per-node features
@@ -387,7 +385,7 @@ class AttackPredictionStateWrapper(gym.Wrapper):
         # History of per-node CLASSIFIED EVENT LABELS (Stage 1's output),
         # shape (n_nodes,) each -- Stage 2 operates on label sequences,
         # not raw features (see models.py).
-        self._label_history: list[np.ndarray] = []
+        self._label_history: list = []
         self.observation_space = env.observation_space
 
     def _classify(self, features: np.ndarray) -> np.ndarray:

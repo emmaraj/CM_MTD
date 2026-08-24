@@ -1,8 +1,9 @@
 """
 generate_figures.py
 --------------------
-Reads the metrics saved by src/main.py (LSTM training history, confusion
-data, RL reward/DSR curves) and renders paper-comparable figures:
+Reads the metrics saved by src/main.py (Stage-2 training history,
+confusion data, RL reward/DSR curves) for one dataset+predictor run and
+renders paper-comparable figures:
 
   fig7_lstm_fidelity_loss.png   <- Fig. 7: prediction fidelity + loss vs. epoch
   fig8_confusion_matrix.png     <- Fig. 8: confusion matrix on the test set
@@ -12,9 +13,15 @@ data, RL reward/DSR curves) and renders paper-comparable figures:
 Fig. 10 (RTT / packet-loss network performance) is intentionally NOT
 generated here -- see the printed note below for why.
 
+Results are read from the SAME namespaced results/<dataset>/<predictor>/
+directory src/main.py writes to (see config_parser.get_run_paths) -- pass
+--dataset/--predictor to point this at a specific run without editing
+config.yaml.
+
 Usage:
     python3 -m src.main --config config/config.yaml --mode all   # produces the data
     python3 scripts/generate_figures.py --config config/config.yaml
+    python3 scripts/generate_figures.py --config config/config.yaml --dataset 5g_nidd --predictor lstm
 """
 
 from __future__ import annotations
@@ -31,6 +38,8 @@ import matplotlib.pyplot as plt
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.config_parser import load_config, apply_cli_overrides, get_run_paths
 
 
 def rolling_mean(x: np.ndarray, window: int) -> np.ndarray:
@@ -246,16 +255,23 @@ def note_fig10_not_available() -> None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config/config.yaml")
+    parser.add_argument("--dataset", type=str, default=None, choices=["cicids2017", "5g_nidd"],
+                         help="Which run to render figures for. Defaults to config.experiment.dataset.")
+    parser.add_argument("--predictor", type=str, default=None, choices=["transformer", "lstm"],
+                         help="Which run to render figures for. Defaults to config.experiment.predictor.")
     parser.add_argument("--smoothing-window", type=int, default=20,
                          help="Rolling-mean window for the convergence plot (episodes).")
     args = parser.parse_args()
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config(args.config)
+    cfg = apply_cli_overrides(cfg, dataset=args.dataset, predictor=args.predictor)
+    run_paths = get_run_paths(cfg)
 
-    results_dir = cfg["experiment"]["results_dir"]
+    results_dir = run_paths["results_dir"]
     out_dir = os.path.join(results_dir, "figures")
     os.makedirs(out_dir, exist_ok=True)
+    print(f"Reading results from {results_dir}/ (dataset={cfg['experiment']['dataset']}, "
+          f"predictor={cfg['experiment']['predictor']})")
 
     any_ok = False
     any_ok |= fig7_lstm_fidelity_loss(results_dir, out_dir)

@@ -90,3 +90,4 @@ dataset/cicids2017/*.npy
 .directory
 .Trash-*
 
+dataset/cicids2017/drl_dataset.zip 

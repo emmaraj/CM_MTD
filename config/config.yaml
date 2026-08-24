@@ -4,79 +4,99 @@
 # (Zhang et al., IEEE JSAC 2023)
 #
 # Every tunable in the pipeline lives here. Nothing in src/ hardcodes a
-# dataset-specific dimension, path, or hyperparameter — swap the `data:`
-# block to point at a different dataset and the rest of the pipeline
-# (LSTM -> DQN -> PPO) adapts automatically via shapes inferred at load time.
+# dataset-specific dimension, path, or hyperparameter — input_dim/num_classes
+# are inferred at load time (src/datasets/base.py::DatasetBundle), and
+# experiment.dataset / experiment.predictor are the pipeline's two
+# independent experimental variables: switch either one without touching
+# any Python.
 # =============================================================================
 
 experiment:
-  name: "cm_mtd_cicids2017"
+  name: "cm_mtd"
+  dataset: "cicids2017"    # "cicids2017" | "5g_nidd" — selects a datasets.<name> block below
+  predictor: "transformer" # "transformer" | "lstm" — selects the transformer:/lstm: block below
   seed: 42
   device: "cpu"          # "cpu" or "gpu" — see README for the TF/GPU notes
   log_dir: "logs"
+  # checkpoint_dir / results_dir below are BASE directories — actual runs
+  # write to <dir>/<dataset>/<predictor>/ (see src/config_parser.py::get_run_paths).
+  # This keeps checkpoints/results from different dataset/predictor
+  # combinations from silently overwriting or shadowing each other, and
+  # matches the layout scripts/generate_figures.py auto-discovers.
   checkpoint_dir: "checkpoints"
-  results_dir: "results"  # saved metrics (history, confusion matrix, reward curves) for scripts/generate_figures.py
+  results_dir: "results"
 
 # -----------------------------------------------------------------------------
-# Dataset — paths are read by src/config_parser.py. input_dim and num_classes
-# are NEVER hardcoded; they are inferred from the .npy arrays at load time.
+# Datasets — one block per dataset this project supports, each pointing at
+# the SELF-CONTAINED directory its own preprocessing notebook writes
+# (notebooks/cicids2017.ipynb / notebooks/5g-nidd.ipynb). Loading is
+# delegated to src/datasets/ (one adapter per dataset, routed through a
+# registry) — see that package's docstring for why: the two notebooks agree
+# on the broad shape (X_*.npy/y_*.npy/class_names.npy/feature_names.npy/
+# preprocessing_metadata.json, chronological 80/10/10 split, same 3-class
+# taxonomy) but differ in real ways a single shared loader would get wrong
+# (CICIDS-2017 alone emits per-sequence dones_*_seq.npy episode-boundary
+# flags; preprocessing_metadata.json's own schema differs between the two).
+#
+# input_dim and num_classes are NEVER set here — always inferred from the
+# .npy arrays themselves at load time.
 # -----------------------------------------------------------------------------
-data:
-  x_train_path: "dataset/cicids2017/X_train_env_state.npy"
-  x_test_path: "dataset/cicids2017/X_test_env_state.npy"
-  y_train_path: "dataset/cicids2017/y_train_env_state.npy"
-  y_test_path: "dataset/cicids2017/y_test_env_state.npy"
+datasets:
+  cicids2017:
+    # Notebook's own CONFIG["OUTPUT_DIR"]. Point this at wherever that
+    # actually landed if you changed it in the notebook.
+    data_dir: "dataset/cicids2017/drl_dataset"
 
-  # Class names, in label-encoder order (0..K-1). Purely cosmetic (logging/
-  # plots) — the code does not assume a class count. For CICIDS-2017 as
-  # preprocessed in cicids2017.ipynb, sklearn's LabelEncoder sorts
-  # alphabetically, giving: 0=Benign, 1=DoS/DDoS, 2=Infiltration.
-  class_names: ["Benign", "DoS/DDoS", "Infiltration"]
+    # Safety cap on how many rows the RL ENVIRONMENT cycles through for its
+    # per-node row assignment (a prior run segfaulted loading the full
+    # CICIDS-2017 label set directly into the env). This does NOT affect
+    # Stage-2 sequence-model training -- that always uses the full,
+    # genuinely-contiguous dataset, since sequence windows need real
+    # row-to-row temporal adjacency that a truncated/reordered view would
+    # fragment. Set to null to disable and let the environment cycle
+    # through every row.
+    max_samples: 200000
 
-  # Safety cap on how many rows the RL ENVIRONMENT cycles through for its
-  # per-node row assignment (a prior run segfaulted loading the full
-  # CICIDS-2017 label set directly into the env). This does NOT affect
-  # LSTM training -- src/main.py::train_lstm always uses the full,
-  # genuinely-contiguous dataset, since LSTM sequence windows need real
-  # row-to-row temporal adjacency that a truncated/reordered view would
-  # fragment. Set to null to disable and let the environment cycle
-  # through every row.
-  max_samples: 200000
+    # Row selection when max_samples < total rows (RL environment only --
+    # see above). "head" is a plain contiguous prefix (preserves order,
+    # but may under-represent rare classes in that prefix). "stratified_head"
+    # takes the first N rows per class instead, which guarantees class
+    # representation for the environment's HAM/RM logic but reorders rows
+    # relative to the original file -- fine here since the environment
+    # already assigns rows to nodes via an artificial round-robin, not
+    # genuine per-node temporal meaning.
+    truncation_strategy: "stratified_head"   # "head" | "stratified_head"
 
-  # Row selection when max_samples < total rows (RL environment only --
-  # see above). "head" is a plain contiguous prefix (preserves order,
-  # but may under-represent rare classes in that prefix).
-  # "stratified_head" takes the first N rows per class instead, which
-  # guarantees class representation for the environment's HAM/RM logic
-  # but reorders rows relative to the original file -- fine here since
-  # the environment already assigns rows to nodes via an artificial
-  # round-robin, not genuine per-node temporal meaning.
-  truncation_strategy: "stratified_head"   # "head" | "stratified_head"
+    # Fallback class names ONLY used if class_names.npy is missing from
+    # data_dir (e.g. an older/partial preprocessing run) -- normally the
+    # notebook's own class_names.npy is authoritative and this is ignored.
+    # In notebook-CLASS_TO_ID order: 0=Benign, 1=Scan/Infiltration, 2=DDoS.
+    class_names: ["Benign", "Scan/Infiltration", "DDoS"]
+
+  5g_nidd:
+    # Notebook's own OUTPUT_DIR.
+    data_dir: "dataset/5g-nidd/drl_dataset"
+    max_samples: 200000
+    truncation_strategy: "stratified_head"
+    # Same 3-class taxonomy as CICIDS-2017 today (see
+    # src/datasets/nidd5g.py's docstring for why this is declared
+    # explicitly per-dataset rather than assumed shared).
+    class_names: ["Benign", "Scan/Infiltration", "DDoS"]
 
 # -----------------------------------------------------------------------------
 # Stage 1: Event Classifier (raw per-row features -> classified event label)
 #
 # scripts/diagnose_separability.py showed these features are highly
 # separable via a plain classifier (Random Forest: ~100% Benign/DoS-DDoS
-# recall) but performed poorly when fed directly into an LSTM as a raw
-# sliding window. This classifier does the part the data is good for;
-# the LSTM below (Stage 2) does the genuinely sequential part -- see
-# models.py's EventClassifier / LSTMAttackPredictor docstrings.
+# recall on CICIDS-2017) but performed poorly when fed directly into an
+# LSTM as a raw sliding window. This classifier does the part the data is
+# good for; the sequence model below (Stage 2) does the genuinely
+# sequential part -- see models.py's EventClassifier / LSTMAttackPredictor
+# docstrings.
 # -----------------------------------------------------------------------------
 event_classifier:
   n_estimators: 200
   max_depth: 16
-
-# -----------------------------------------------------------------------------
-# Stage 2 predictor selector. "transformer" is the current default -- see
-# the methodology report / models.py::TransformerAttackPredictor docstring
-# for the justification (short, low-cardinality sequences where removing
-# recurrence enables full parallelization, plus self-attention gives a
-# directly inspectable interpretability signal an LSTM's hidden state
-# doesn't). "lstm" is kept fully working for direct comparison -- see
-# scripts/compare_architectures.py.
-# -----------------------------------------------------------------------------
-predictor_type: "transformer"   # "transformer" | "lstm"
 
 # -----------------------------------------------------------------------------
 # Stage 2: LSTM Attack Predictor (Section VI-A, Eq. 11-12, Fig. 4)
@@ -85,7 +105,8 @@ predictor_type: "transformer"   # "transformer" | "lstm"
 # Stage 1 assigns to recent rows, not raw features -- matching the paper's
 # own description of the LSTM's input as classified "detection logs"
 # (Section IV), and matching Eq. 12's literal formulation
-# (X^t_k = past event labels).
+# (X^t_k = past event labels). Shared across datasets — dataset choice
+# only changes num_classes (inferred) and the data feeding Stage 1.
 # -----------------------------------------------------------------------------
 lstm:
   sequence_length: 10        # L in Eq. 12 — length of history window
@@ -101,14 +122,14 @@ lstm:
   # the deeper problem observed on real CICIDS-2017 data: with a STATIC
   # per-class weight multiplier, training either collapsed to
   # always-predict-Benign (weight too mild) or overcorrected to
-  # mostly-predict-DoS/DDoS (weight too strong). Focal loss (Lin et al.
+  # mostly-predict-DDoS (weight too strong). Focal loss (Lin et al.
   # 2017, models.py::categorical_focal_loss) is offered as an alternative
   # that in principle should be less sensitive to the exact class_weight
   # ratio -- BUT testing against a synthetic reproduction of this exact
   # failure pattern did NOT reliably escape the collapse either. Treat
   # this as an available option worth trying, not a proven fix; run
   # scripts/diagnose_separability.py against your real data first to
-  # determine whether the problem is even in this LSTM/windowing
+  # determine whether the problem is even in this sequence-model/windowing
   # pipeline, versus upstream in feature preprocessing.
   loss_function: "focal"   # "focal" | "categorical_crossentropy" | "mse"
   focal_gamma: 2.0          # only used when loss_function="focal"; higher = more focus on hard examples
@@ -116,19 +137,20 @@ lstm:
   epochs: 15
   validation_split: 0.1
 
-  # CICIDS-2017's Infiltration class is extremely rare (~0.001% of rows).
-  # A naive `class_weight="balanced"` produces weights so large that
-  # training collapses (loss -> NaN, predictions collapse to one class).
+  # CICIDS-2017's Scan/Infiltration class is a small minority (it absorbs
+  # the tiny original "Infiltration" label, so it inherits some of that
+  # rarity even collapsed together with PortScan/Web-Attack/Patator/Bot).
+  # A naive `class_weight="balanced"` produces weights large enough that
+  # training can collapse (loss -> NaN, predictions collapse to one class).
   # We use balanced weights but clip the max/min ratio.
   # balanced_capped (inverse-frequency, then ratio-clipped) was the
   # original default but was observed to overcorrect on real CICIDS-2017
-  # data: DoS/DDoS (14% of rows -- not actually rare) got boosted ~6x
-  # relative to Benign, which flipped the model from "always predict
-  # Benign" to "mostly predict DoS/DDoS" and made net accuracy WORSE than
-  # the trivial majority-class baseline. balanced_sqrt dampens the same
-  # inverse-frequency weights via sqrt (~2.4x DoS/DDoS:Benign instead of
-  # ~6x) -- gentler, and now paired with focal loss above so getting this
-  # exact ratio right matters less than it did with crossentropy alone.
+  # data: DDoS (~13% of rows -- not actually rare) got boosted enough to
+  # flip the model from "always predict Benign" to "mostly predict DDoS",
+  # making net accuracy WORSE than the trivial majority-class baseline.
+  # balanced_sqrt dampens the same inverse-frequency weights via sqrt --
+  # gentler, and now paired with focal loss above so getting this exact
+  # ratio right matters less than it did with crossentropy alone.
   class_weight_strategy: "balanced_sqrt"   # "none" | "balanced" | "balanced_capped" | "balanced_sqrt"
   max_class_weight_ratio: 20.0                # cap: max_weight <= ratio * min_weight
 
@@ -159,7 +181,7 @@ transformer:
 
 # -----------------------------------------------------------------------------
 # Fairness / Trust / Energy evaluation (see src/metrics.py). Computed
-# during --mode train_lstm / --mode all and saved to results/.
+# during --mode train_lstm / --mode all and saved to results/<dataset>/<predictor>/.
 # -----------------------------------------------------------------------------
 evaluation:
   compute_fairness: true
@@ -172,7 +194,7 @@ evaluation:
 # -----------------------------------------------------------------------------
 # Network / Digital Twin topology (Section III-A, Table I)
 # Generated with a Waxman random graph via NetworkX, consistent with the
-# paper's simulation setup.
+# paper's simulation setup. Dataset-independent.
 # -----------------------------------------------------------------------------
 network:
   topology: "waxman"

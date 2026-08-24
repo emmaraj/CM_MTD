@@ -2,9 +2,17 @@
 config_parser.py
 -----------------
 Configuration loading and dataset ingestion utilities for the CM-MTD
-pipeline. Nothing here hardcodes a dataset's shape — `input_dim` and
-`num_classes` are always inferred from the loaded arrays, per the
-project's dataset-agnostic requirement.
+pipeline. Nothing here hardcodes a dataset's shape -- `input_dim` and
+`num_classes` are always inferred from the loaded arrays (see
+src/datasets/base.py::DatasetBundle), per the project's dataset-agnostic
+requirement.
+
+Dataset loading itself is delegated to src/datasets/ (one adapter per
+dataset, routed through a small registry) -- see that package's module
+docstring for why a single shared loader was the wrong call once a
+second dataset (5G-NIDD) with its own directory contract and metadata
+schema entered the picture. This module only knows "ask the registry for
+whichever dataset config.experiment.dataset names."
 """
 
 from __future__ import annotations
@@ -12,11 +20,16 @@ from __future__ import annotations
 import os
 import random
 import logging
-from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import numpy as np
 import yaml
+
+from src.datasets import DatasetBundle, get_adapter
+
+# Re-exported for any call sites (or REPL usage) still written against the
+# pre-refactor `Dataset` name -- it's just the current DatasetBundle.
+Dataset = DatasetBundle
 
 logger = logging.getLogger("cm_mtd")
 
@@ -36,10 +49,106 @@ def load_config(path: str) -> dict:
 
 
 def _validate_config(cfg: dict) -> None:
-    required_top_level = ["data", "lstm", "network", "reward", "dqn", "ppo", "training"]
+    required_top_level = ["experiment", "datasets", "lstm", "transformer",
+                           "network", "reward", "dqn", "ppo", "training"]
     missing = [k for k in required_top_level if k not in cfg]
     if missing:
         raise KeyError(f"config.yaml is missing required section(s): {missing}")
+
+    exp = cfg["experiment"]
+    for key in ("dataset", "predictor"):
+        if key not in exp:
+            raise KeyError(
+                f"config.yaml's experiment: block is missing '{key}'. experiment.dataset and "
+                f"experiment.predictor are the pipeline's two independent experimental "
+                f"variables -- experiment.dataset selects a config.datasets.<name> block, "
+                f"experiment.predictor selects config.lstm or config.transformer."
+            )
+
+
+def apply_cli_overrides(cfg: dict, dataset: Optional[str] = None, predictor: Optional[str] = None) -> dict:
+    """
+    Applies --dataset/--predictor CLI overrides on top of whatever
+    config.yaml says, so comparison runs across datasets/architectures
+    don't require hand-editing the file each time:
+
+        cfg = apply_cli_overrides(load_config(args.config), args.dataset, args.predictor)
+
+    Mutates and returns cfg for convenient chaining. Values are validated
+    lazily -- active_dataset_cfg()/active_predictor_cfg() below raise a
+    clear error if the override doesn't match anything configured.
+    """
+    if dataset is not None:
+        cfg["experiment"]["dataset"] = dataset
+    if predictor is not None:
+        cfg["experiment"]["predictor"] = predictor
+    return cfg
+
+
+def active_dataset_cfg(cfg: dict) -> dict:
+    """cfg['datasets'][cfg['experiment']['dataset']] -- this run's dataset sub-config."""
+    dataset_name = cfg["experiment"]["dataset"]
+    datasets_cfg = cfg.get("datasets", {})
+    if dataset_name not in datasets_cfg:
+        raise KeyError(
+            f"experiment.dataset={dataset_name!r} but config.yaml's datasets: block has no "
+            f"{dataset_name!r} entry. Configured datasets: {sorted(datasets_cfg.keys())}."
+        )
+    return datasets_cfg[dataset_name]
+
+
+def active_predictor_cfg(cfg: dict) -> dict:
+    """cfg[cfg['experiment']['predictor']] -- e.g. cfg['transformer'] or cfg['lstm']."""
+    predictor = cfg["experiment"]["predictor"]
+    if predictor not in cfg:
+        raise KeyError(
+            f"experiment.predictor={predictor!r} but config.yaml has no top-level "
+            f"{predictor!r} section. Expected one of the sequence-model config blocks "
+            f"(currently 'lstm' or 'transformer')."
+        )
+    return cfg[predictor]
+
+
+def active_training_cfg(cfg: dict) -> dict:
+    """
+    cfg['training'] -- kept alongside active_dataset_cfg/active_predictor_cfg
+    so call sites read uniformly ("the active X config") even though
+    training: isn't currently split per-dataset/per-predictor the way
+    lstm:/transformer: and datasets:<name> are.
+    """
+    return cfg["training"]
+
+
+def get_run_paths(cfg: dict) -> dict:
+    """
+    Namespaces checkpoint/results output by dataset+predictor, e.g.
+    checkpoints/cicids2017/transformer/, results/5g_nidd/lstm/. Without
+    this, switching config.experiment.dataset or .predictor between runs
+    would silently overwrite or reuse a previous run's checkpoints -- a
+    real footgun now that dataset and predictor are two independent
+    experimental variables (e.g. training on 5g_nidd right after
+    cicids2017 could otherwise load stale CICIDS-2017 checkpoints into a
+    "5G-NIDD" evaluation without any error).
+
+    Also matches the results/<dataset_name>/<model_type>/ layout
+    scripts/generate_figures.py already expects for its cross-dataset/
+    cross-model auto-discovery figure pipeline.
+
+    log_dir is left flat (un-namespaced) -- one process writing one log
+    stream is fine either way, and it's convenient to `tail` a single
+    file across an experimentation session that touches multiple
+    dataset/predictor combinations.
+    """
+    exp_cfg = cfg["experiment"]
+    dataset_name = exp_cfg["dataset"]
+    predictor = exp_cfg["predictor"]
+    run_subdir = os.path.join(dataset_name, predictor)
+    return {
+        "log_dir": exp_cfg["log_dir"],
+        "checkpoint_dir": os.path.join(exp_cfg["checkpoint_dir"], run_subdir),
+        "results_dir": os.path.join(exp_cfg["results_dir"], run_subdir),
+        "run_subdir": run_subdir,
+    }
 
 
 def set_global_seed(seed: int) -> None:
@@ -54,57 +163,37 @@ def set_global_seed(seed: int) -> None:
 
 
 # =============================================================================
-# Dataset container
+# Dataset loading -- delegates to src/datasets/'s adapter registry
 # =============================================================================
 
-@dataclass
-class Dataset:
+def load_dataset(cfg: dict) -> DatasetBundle:
     """
-    Holds the loaded .npy arrays plus dimensions inferred from them.
-    `input_dim` and `num_classes` are the two values the rest of the
-    pipeline (LSTM, environment) reads instead of ever hardcoding a number.
+    Loads whichever dataset config.experiment.dataset names, via that
+    dataset's adapter (src/datasets/). Returns a DatasetBundle with
+    input_dim/num_classes inferred from the arrays, never hardcoded --
+    see src/datasets/base.py.
     """
-    X_train: np.ndarray
-    X_test: np.ndarray
-    y_train: np.ndarray
-    y_test: np.ndarray
-    input_dim: int = field(init=False)
-    num_classes: int = field(init=False)
-    class_names: list = field(default_factory=list)
-
-    def __post_init__(self):
-        if self.X_train.ndim != 2:
-            raise ValueError(
-                f"Expected X_train to be 2D [n_samples, n_features], got shape {self.X_train.shape}"
-            )
-        self.input_dim = self.X_train.shape[1]
-        self.num_classes = int(max(self.y_train.max(), self.y_test.max())) + 1
-
-        if self.X_test.shape[1] != self.input_dim:
-            raise ValueError(
-                f"X_train has {self.input_dim} features but X_test has {self.X_test.shape[1]}"
-            )
-        if not self.class_names:
-            self.class_names = [f"class_{i}" for i in range(self.num_classes)]
-        if len(self.class_names) != self.num_classes:
-            logger.warning(
-                "config.data.class_names has %d entries but %d classes were "
-                "inferred from the data; falling back to generic names "
-                "(class_0, class_1, ...). If anything downstream looks up a "
-                "class by name (e.g. environment.py's HAM/RM logic expects "
-                "'Infiltration' and 'DoS/DDoS'), it will now fail loudly -- "
-                "check config.data.x_train_path/y_train_path aren't pointing "
-                "at stale .npy files from a different preprocessing run.",
-                len(self.class_names), self.num_classes,
-            )
-            self.class_names = [f"class_{i}" for i in range(self.num_classes)]
+    dataset_name = cfg["experiment"]["dataset"]
+    adapter = get_adapter(dataset_name)
+    dataset_cfg = active_dataset_cfg(cfg)
+    logger.info("Loading dataset %r via %s", dataset_name, type(adapter).__name__)
+    bundle = adapter.load(dataset_cfg)
+    logger.info(
+        "Dataset %r ready: input_dim=%d, num_classes=%d, classes=%s, "
+        "train=%d val=%s test=%d, reconnaissance_class=%r(id=%d), flooding_class=%r(id=%d)",
+        dataset_name, bundle.input_dim, bundle.num_classes, bundle.class_names,
+        len(bundle.X_train), len(bundle.X_val) if bundle.X_val is not None else "n/a", len(bundle.X_test),
+        bundle.reconnaissance_class_name, bundle.reconnaissance_class,
+        bundle.flooding_class_name, bundle.flooding_class,
+    )
+    return bundle
 
 
-def _stratified_head(X: np.ndarray, y: np.ndarray, max_samples: int) -> tuple[np.ndarray, np.ndarray]:
+def _stratified_head(X: np.ndarray, y: np.ndarray, max_samples: int) -> tuple:
     """
     Deterministically take the first-occurring rows per class, interleaved
     in original order, until max_samples rows are collected. No randomness
-    is used — this keeps dataset truncation reproducible and consistent
+    is used -- this keeps dataset truncation reproducible and consistent
     with the "no synthetic/random stepping" requirement.
     """
     classes = np.unique(y)
@@ -128,64 +217,26 @@ def _stratified_head(X: np.ndarray, y: np.ndarray, max_samples: int) -> tuple[np
     return X[keep_idx], y[keep_idx]
 
 
-def load_dataset(cfg: dict) -> Dataset:
-    """
-    Load X/y train/test .npy arrays as specified in config['data'] and
-    return a Dataset with input_dim / num_classes inferred (never
-    hardcoded). Deliberately does NOT truncate here: the LSTM's sliding-
-    window training (config_parser is dataset-agnostic and doesn't know
-    about windowing, but models.py's build_sliding_windows assumes genuine
-    row-to-row temporal adjacency) needs the full, originally-ordered
-    data. The RL environment's max_samples cap is applied separately, only
-    to the row-cycling view it builds for itself in environment.py -- see
-    that module's docstring for why sharing one truncated view between
-    both consumers was a bug (stratified truncation reorders/subsamples
-    rows, which is fine for a classifier but fragments the temporal
-    continuity LSTM sequence windows depend on).
-    """
-    data_cfg = cfg["data"]
-
-    def _load(path_key: str) -> np.ndarray:
-        path = data_cfg[path_key]
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"Dataset file not found at '{path}' (config.data.{path_key}). "
-                f"Run the preprocessing notebook first, or point config.yaml "
-                f"at your existing .npy files."
-            )
-        arr = np.load(path)
-        logger.info("Loaded %s -> shape %s dtype %s", path, arr.shape, arr.dtype)
-        return arr
-
-    X_train = _load("x_train_path").astype(np.float32)
-    X_test = _load("x_test_path").astype(np.float32)
-    y_train = _load("y_train_path").astype(np.int64).reshape(-1)
-    y_test = _load("y_test_path").astype(np.int64).reshape(-1)
-
-    return Dataset(
-        X_train=X_train,
-        X_test=X_test,
-        y_train=y_train,
-        y_test=y_test,
-        class_names=list(data_cfg.get("class_names", [])),
-    )
-
-
-def build_env_row_cache(dataset: "Dataset", data_cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+def build_env_row_cache(dataset: DatasetBundle, dataset_cfg: dict) -> tuple:
     """
     Builds the (possibly truncated) X/y view the RL environment cycles
     through for its per-node row assignment. This is the ONLY place
-    max_samples/truncation_strategy apply -- LSTM training always sees the
-    full dataset via `dataset.X_train`/`dataset.y_train` directly. Row
-    order/continuity doesn't matter here the way it does for LSTM
-    sequence windows, since environment.py already assigns rows to nodes
-    via an artificial deterministic round-robin, not genuine per-node
-    temporal adjacency.
+    max_samples/truncation_strategy apply -- Stage-2 sequence-model
+    training always sees the full dataset via `dataset.X_train`/
+    `dataset.y_train` directly. Row order/continuity doesn't matter here
+    the way it does for LSTM/Transformer sequence windows, since
+    environment.py already assigns rows to nodes via an artificial
+    deterministic round-robin, not genuine per-node temporal adjacency.
+
+    dataset_cfg is this dataset's own config.datasets.<name> block (see
+    config_parser.active_dataset_cfg) -- max_samples/truncation_strategy
+    now live per-dataset (each dataset has its own size/imbalance
+    profile) rather than in one shared top-level `data:` block.
     """
     X_train, y_train = dataset.X_train, dataset.y_train
-    max_samples = data_cfg.get("max_samples")
+    max_samples = dataset_cfg.get("max_samples")
     if max_samples is not None and len(X_train) > max_samples:
-        strategy = data_cfg.get("truncation_strategy", "head")
+        strategy = dataset_cfg.get("truncation_strategy", "head")
         if strategy == "stratified_head":
             X_train, y_train = _stratified_head(X_train, y_train, max_samples)
         elif strategy == "head":
@@ -194,7 +245,7 @@ def build_env_row_cache(dataset: "Dataset", data_cfg: dict) -> tuple[np.ndarray,
             raise ValueError(f"Unknown truncation_strategy: {strategy}")
         logger.info(
             "Environment row cache truncated to %d rows via '%s' strategy "
-            "(bounds memory for the RL loop; LSTM training is unaffected "
+            "(bounds memory for the RL loop; Stage-2 training is unaffected "
             "and uses the full dataset).",
             len(X_train), strategy,
         )
@@ -202,8 +253,8 @@ def build_env_row_cache(dataset: "Dataset", data_cfg: dict) -> tuple[np.ndarray,
 
 
 # =============================================================================
-# Class weighting (guards against the LSTM-collapse failure mode seen with
-# CICIDS-2017's severely under-represented Infiltration class)
+# Class weighting (guards against the LSTM/Transformer-collapse failure
+# mode seen with CICIDS-2017's severely under-represented minority class)
 # =============================================================================
 
 def compute_class_weights(y: np.ndarray, num_classes: int, strategy: str = "balanced_capped",
@@ -218,12 +269,12 @@ def compute_class_weights(y: np.ndarray, num_classes: int, strategy: str = "bala
                             max_weight <= max_ratio * min_weight. Fixes
                             gradient blow-up on a severely under-represented
                             class, but on real CICIDS-2017 data this was
-                            observed to overcorrect the OTHER way: DoS/DDoS
-                            (a substantial 14% of rows, not a tiny minority)
-                            got enough of a boost that the model flipped
-                            from "always predict Benign" to "mostly predict
-                            DoS/DDoS", making net accuracy *worse* than the
-                            trivial majority-class baseline.
+                            observed to overcorrect the OTHER way: DDoS
+                            (a substantial ~8-13% of rows, not a tiny
+                            minority) got enough of a boost that the model
+                            flipped from "always predict Benign" to "mostly
+                            predict DDoS", making net accuracy *worse* than
+                            the trivial majority-class baseline.
       "balanced_sqrt"   -> sqrt-dampened inverse-frequency: weight ∝
                             sqrt(n / (k * count)) instead of the full ratio.
                             A gentler, commonly-used alternative that still
@@ -290,7 +341,7 @@ def configure_device(device: str) -> None:
 def reset_tf_session() -> None:
     """
     Clear the Keras/TF backend graph and free session state. Call this
-    between agent (re)initializations within a single process — repeatedly
+    between agent (re)initializations within a single process -- repeatedly
     building models without clearing sessions is a common source of
     creeping GPU/CPU memory growth over long training runs.
     """
