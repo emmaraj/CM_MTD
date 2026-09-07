@@ -270,16 +270,24 @@ def track_energy(label: str = "run"):
             report.estimated_energy_kwh = (_ASSUMED_AVG_POWER_WATTS * elapsed / 3600.0) / 1000.0
 
 
-def count_trainable_params(keras_model) -> int:
-    return int(sum(np.prod(v.shape) for v in keras_model.trainable_variables))
+def count_trainable_params(model) -> int:
+    """
+    Works for any torch.nn.Module (previously assumed a Keras model with
+    .trainable_variables -- PyTorch's equivalent is .parameters(), each
+    with its own .requires_grad rather than the model tracking a separate
+    trainable/non-trainable variable list).
+    """
+    return int(sum(p.numel() for p in model.parameters() if p.requires_grad))
 
 
 def benchmark_inference_latency(predict_fn, sample_input, n_calls: int = 200, warmup: int = 10) -> float:
     """
-    Mean milliseconds per call for a single-window prediction. Reuses the
-    same warmup-then-time methodology used earlier in this project to
-    validate the tf.function performance fixes -- first call(s) pay
-    one-time graph-tracing cost, which must be excluded from the average.
+    Mean milliseconds per call for a single-window prediction. Warms up
+    first (a few calls are excluded from the average) before timing --
+    first call(s) pay one-time costs (e.g. lazy CUDA context/kernel
+    initialization, or historically, tf.function graph tracing under the
+    project's earlier TensorFlow implementation) that would otherwise
+    skew a small n_calls average.
     """
     for _ in range(warmup):
         predict_fn(sample_input)

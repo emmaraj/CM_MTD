@@ -1,0 +1,31 @@
+{
+  "dataset": "5g_nidd",
+  "predictor_type": "transformer",
+  "fidelity": 0.976542001496969,
+  "fairness_class": {
+    "min_recall": 0.9185668889897685,
+    "max_recall": 0.9944051128660886,
+    "recall_gap": 0.07583822387632011,
+    "equity_ratio": 0.9237350825180916
+  },
+  "calibration_ece": 0.11575690304413586,
+  "prediction_stability": {
+    "n_tested": 500,
+    "n_flipped": 0,
+    "flip_rate": 0.0
+  },
+  "attention_entropy": {
+    "mean_normalized_entropy": 0.9900460544097237,
+    "std_normalized_entropy": 0.048932246388591484,
+    "min_normalized_entropy": 0.0541951933245237,
+    "max_normalized_entropy": 0.9999761987958996
+  },
+  "energy": {
+    "training_wall_clock_seconds": 1226.5504376888275,
+    "training_estimated_kwh": 0.008002377186638349,
+    "training_estimated_co2_kg": 0.005656008174121306,
+    "energy_measurement_method": "codecarbon",
+    "trainable_params": 26979,
+    "inference_ms_per_call": 1.171576976776123
+  }
+}

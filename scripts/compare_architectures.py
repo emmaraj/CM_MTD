@@ -29,13 +29,13 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def run_one(cfg: dict, dataset, predictor_type: str, logger):
+def run_one(cfg: dict, dataset, predictor_type: str, device, logger):
     from src.main import _build_predictor
-    from src.config_parser import compute_class_weights, reset_tf_session
+    from src.config_parser import compute_class_weights, reset_torch_session
     from src.models import EventClassifier
     from src import metrics as metrics_mod
 
-    reset_tf_session()
+    reset_torch_session()
     stage2_cfg = cfg[predictor_type]
 
     clf_cfg = cfg["event_classifier"]
@@ -51,7 +51,7 @@ def run_one(cfg: dict, dataset, predictor_type: str, logger):
     )
 
     with metrics_mod.track_energy(f"compare_{predictor_type}") as energy_report:
-        predictor = _build_predictor(predictor_type, dataset.num_classes, cfg)
+        predictor = _build_predictor(predictor_type, dataset.num_classes, cfg, device=device)
         predictor.fit(train_pred, dataset.y_train, class_weight=class_weight, seed=cfg["experiment"]["seed"])
 
     fidelity_metrics = predictor.compute_fidelity(test_pred, dataset.y_test)
@@ -135,14 +135,14 @@ def main():
 
     logger = setup_logging(cfg["experiment"]["log_dir"])
     set_global_seed(cfg["experiment"]["seed"])
-    configure_device(cfg["experiment"]["device"])
+    device = configure_device(cfg["experiment"]["device"])
     dataset = load_dataset(cfg)
-    logger.info("Comparing LSTM vs Transformer on %s (input_dim=%d, num_classes=%d)",
-                dataset_name, dataset.input_dim, dataset.num_classes)
+    logger.info("Comparing LSTM vs Transformer on %s (input_dim=%d, num_classes=%d, device=%s)",
+                dataset_name, dataset.input_dim, dataset.num_classes, device)
 
     results = {
-        "lstm": run_one(cfg, dataset, "lstm", logger),
-        "transformer": run_one(cfg, dataset, "transformer", logger),
+        "lstm": run_one(cfg, dataset, "lstm", device, logger),
+        "transformer": run_one(cfg, dataset, "transformer", device, logger),
     }
 
     print_comparison_table(results)

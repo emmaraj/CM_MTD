@@ -34,13 +34,14 @@ import os
 import sys
 
 import numpy as np
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config_parser import (
     load_config, apply_cli_overrides, active_dataset_cfg, active_predictor_cfg,
     get_run_paths, set_global_seed, load_dataset, compute_class_weights,
-    configure_device, reset_tf_session, setup_logging,
+    configure_device, reset_torch_session, setup_logging,
 )
 from src.environment import (
     DigitalTwinNetworkEnv, AttackPredictionStateWrapper, NUM_MACRO_ACTIONS,
@@ -49,16 +50,16 @@ from src.models import LSTMAttackPredictor, TransformerAttackPredictor, EventCla
 from src import metrics as metrics_mod
 
 
-def _build_predictor(predictor_type: str, num_classes: int, cfg: dict):
+def _build_predictor(predictor_type: str, num_classes: int, cfg: dict, device=None):
     if predictor_type == "transformer":
-        return TransformerAttackPredictor(num_classes, cfg["transformer"])
+        return TransformerAttackPredictor(num_classes, cfg["transformer"], device=device)
     elif predictor_type == "lstm":
-        return LSTMAttackPredictor(num_classes, cfg["lstm"])
+        return LSTMAttackPredictor(num_classes, cfg["lstm"], device=device)
     else:
         raise ValueError(f"Unknown predictor {predictor_type!r} (expected 'transformer' or 'lstm')")
 
 
-def train_attack_predictor(cfg: dict, dataset, run_paths: dict, logger):
+def train_attack_predictor(cfg: dict, dataset, run_paths: dict, device, logger):
     """
     Trains the full two-stage attack predictor:
       Stage 1 (EventClassifier): raw features -> classified event label.
@@ -70,7 +71,7 @@ def train_attack_predictor(cfg: dict, dataset, run_paths: dict, logger):
     docstrings for why this replaced a single LSTM trained directly on
     raw feature sequences.
     """
-    reset_tf_session()
+    reset_torch_session()
     predictor_type = cfg["experiment"]["predictor"]
     stage2_cfg = active_predictor_cfg(cfg)
 
@@ -103,11 +104,11 @@ def train_attack_predictor(cfg: dict, dataset, run_paths: dict, logger):
     energy_report = None
     if eval_cfg.get("compute_energy", True):
         with metrics_mod.track_energy(f"{predictor_type}_training") as energy_report:
-            predictor = _build_predictor(predictor_type, dataset.num_classes, cfg)
+            predictor = _build_predictor(predictor_type, dataset.num_classes, cfg, device=device)
             history = predictor.fit(train_pred_labels, dataset.y_train, class_weight=class_weight,
                                      seed=cfg["experiment"]["seed"])
     else:
-        predictor = _build_predictor(predictor_type, dataset.num_classes, cfg)
+        predictor = _build_predictor(predictor_type, dataset.num_classes, cfg, device=device)
         history = predictor.fit(train_pred_labels, dataset.y_train, class_weight=class_weight,
                                  seed=cfg["experiment"]["seed"])
 
@@ -200,12 +201,12 @@ def train_attack_predictor(cfg: dict, dataset, run_paths: dict, logger):
     ckpt_dir = run_paths["checkpoint_dir"]
     os.makedirs(ckpt_dir, exist_ok=True)
     classifier.save(os.path.join(ckpt_dir, "event_classifier.joblib"))
-    predictor.model.save(os.path.join(ckpt_dir, f"{predictor_type}_predictor.keras"))
+    torch.save(predictor.model.state_dict(), os.path.join(ckpt_dir, f"{predictor_type}_predictor.pt"))
     logger.info("Saved Stage-1 classifier and Stage-2 %s predictor to %s/", predictor_type, ckpt_dir)
     return classifier, predictor
 
 
-def train_rl(cfg: dict, dataset, classifier, predictor, run_paths: dict, logger):
+def train_rl(cfg: dict, dataset, classifier, predictor, run_paths: dict, device, logger):
     seed = cfg["experiment"]["seed"]
     net_cfg = cfg["network"]
     reward_cfg = cfg["reward"]
@@ -217,10 +218,10 @@ def train_rl(cfg: dict, dataset, classifier, predictor, run_paths: dict, logger)
     env = AttackPredictionStateWrapper(base_env, classifier, predictor, seq_len)
 
     state_dim = base_env.n_nodes
-    dqn = DQNAgent(state_dim=state_dim, num_actions=NUM_MACRO_ACTIONS, cfg=cfg["dqn"], seed=seed)
+    dqn = DQNAgent(state_dim=state_dim, num_actions=NUM_MACRO_ACTIONS, cfg=cfg["dqn"], seed=seed, device=device)
     ppo = PPOAgent(
         state_dim=state_dim, n_nodes=base_env.n_nodes, num_ip_pools=net_cfg["num_ip_pools"],
-        num_flows=net_cfg["num_flows"], num_route_candidates=3, cfg=cfg["ppo"], seed=seed,
+        num_flows=net_cfg["num_flows"], num_route_candidates=3, cfg=cfg["ppo"], seed=seed, device=device,
     )
 
     M = cfg["training"]["num_episodes"]
@@ -300,9 +301,9 @@ def train_rl(cfg: dict, dataset, classifier, predictor, run_paths: dict, logger)
             base_env.stats.reset()  # windowed DSR, matching the paper's per-1000-episode averaging
 
         if episode % save_every == 0:
-            dqn.q_network.save(os.path.join(ckpt_dir, f"dqn_q_network_ep{episode}.keras"))
-            ppo.actor.save(os.path.join(ckpt_dir, f"ppo_actor_ep{episode}.keras"))
-            ppo.critic.save(os.path.join(ckpt_dir, f"ppo_critic_ep{episode}.keras"))
+            torch.save(dqn.q_network.state_dict(), os.path.join(ckpt_dir, f"dqn_q_network_ep{episode}.pt"))
+            torch.save(ppo.actor.state_dict(), os.path.join(ckpt_dir, f"ppo_actor_ep{episode}.pt"))
+            torch.save(ppo.critic.state_dict(), os.path.join(ckpt_dir, f"ppo_critic_ep{episode}.pt"))
             logger.info("Saved RL checkpoints at episode %d", episode)
 
     results_dir = run_paths["results_dir"]
@@ -342,10 +343,10 @@ def main():
 
     logger = setup_logging(run_paths["log_dir"])
     set_global_seed(cfg["experiment"]["seed"])
-    configure_device(cfg["experiment"]["device"])
+    device = configure_device(cfg["experiment"]["device"])
 
-    logger.info("Run: dataset=%s predictor=%s (checkpoints -> %s, results -> %s)",
-                cfg["experiment"]["dataset"], cfg["experiment"]["predictor"],
+    logger.info("Run: dataset=%s predictor=%s device=%s (checkpoints -> %s, results -> %s)",
+                cfg["experiment"]["dataset"], cfg["experiment"]["predictor"], device,
                 run_paths["checkpoint_dir"], run_paths["results_dir"])
 
     logger.info("Loading dataset...")
@@ -357,13 +358,12 @@ def main():
     classifier = None
     predictor_type = cfg["experiment"]["predictor"]
     ckpt_dir = run_paths["checkpoint_dir"]
-    predictor_ckpt_path = os.path.join(ckpt_dir, f"{predictor_type}_predictor.keras")
+    predictor_ckpt_path = os.path.join(ckpt_dir, f"{predictor_type}_predictor.pt")
     classifier_ckpt_path = os.path.join(ckpt_dir, "event_classifier.joblib")
 
     if args.mode in ("train_lstm", "all"):
-        classifier, predictor = train_attack_predictor(cfg, dataset, run_paths, logger)
+        classifier, predictor = train_attack_predictor(cfg, dataset, run_paths, device, logger)
     else:
-        import tensorflow as tf
         if not (os.path.exists(predictor_ckpt_path) and os.path.exists(classifier_ckpt_path)):
             raise FileNotFoundError(
                 f"No checkpoint found at {predictor_ckpt_path} / {classifier_ckpt_path}. "
@@ -374,19 +374,24 @@ def main():
         classifier = EventClassifier()
         classifier.load(classifier_ckpt_path)
         logger.info("Loading Stage-2 %s predictor from %s", predictor_type, predictor_ckpt_path)
-        keras_model = tf.keras.models.load_model(predictor_ckpt_path, compile=False)
-        predictor = _build_predictor(predictor_type, dataset.num_classes, cfg)
-        predictor.model = keras_model
-        # _infer_fn was tf.function-compiled against the freshly-initialized
-        # model at construction time; rebind it to the loaded model so
-        # inference (and, for the Transformer, attention extraction) uses
-        # the trained weights rather than the discarded random init.
-        predictor._infer_fn = tf.function(
-            lambda x: predictor.model(x, training=False), reduce_retracing=True
-        )
+        # Build the predictor fresh (random init, correct architecture/device
+        # from config.yaml) then load the trained weights into it -- unlike
+        # the old tf.keras.models.load_model() call, which deserialized a
+        # complete new model object, PyTorch checkpoints are just a
+        # state_dict (tensor weights only), so the architecture has to be
+        # (re)constructed from config.yaml first. Since config.yaml is the
+        # same file that produced the checkpoint in the first place, this
+        # isn't a real risk in practice -- but if you DO change
+        # lstm:/transformer: hyperparameters between training and loading a
+        # checkpoint, load_state_dict below will raise a clear shape-mismatch
+        # error rather than silently loading the wrong architecture.
+        predictor = _build_predictor(predictor_type, dataset.num_classes, cfg, device=device)
+        state_dict = torch.load(predictor_ckpt_path, map_location=device)
+        predictor.model.load_state_dict(state_dict)
+        predictor.model.eval()
 
     if args.mode in ("train_rl", "all"):
-        results = train_rl(cfg, dataset, classifier, predictor, run_paths, logger)
+        results = train_rl(cfg, dataset, classifier, predictor, run_paths, device, logger)
         final_dsr = results["base_env"].stats.dsr()
         logger.info("Training complete. Final-window DSR (Eq. 19): %.3f", final_dsr)
 

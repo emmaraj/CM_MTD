@@ -1,0 +1,31 @@
+{
+  "dataset": "cicids2017",
+  "predictor_type": "transformer",
+  "fidelity": 0.9674845000264957,
+  "fairness_class": {
+    "min_recall": 0.0,
+    "max_recall": 0.9999342775459236,
+    "recall_gap": 0.9999342775459236,
+    "equity_ratio": 0.0
+  },
+  "calibration_ece": 0.13871638547131188,
+  "prediction_stability": {
+    "n_tested": 500,
+    "n_flipped": 0,
+    "flip_rate": 0.0
+  },
+  "attention_entropy": {
+    "mean_normalized_entropy": 0.9933480127128649,
+    "std_normalized_entropy": 0.05979163154470589,
+    "min_normalized_entropy": 0.011173877224467294,
+    "max_normalized_entropy": 0.9999843787618893
+  },
+  "energy": {
+    "training_wall_clock_seconds": 2935.2107520103455,
+    "training_estimated_kwh": 0.01954440635568483,
+    "training_estimated_co2_kg": 0.013813810512540837,
+    "energy_measurement_method": "codecarbon",
+    "trainable_params": 26979,
+    "inference_ms_per_call": 1.0153722763061523
+  }
+}

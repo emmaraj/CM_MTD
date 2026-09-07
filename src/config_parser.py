@@ -152,12 +152,14 @@ def get_run_paths(cfg: dict) -> dict:
 
 
 def set_global_seed(seed: int) -> None:
-    """Seed python, numpy, and (if importable) tensorflow for reproducibility."""
+    """Seed python, numpy, and (if importable) torch for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     try:
-        import tensorflow as tf
-        tf.random.set_seed(seed)
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     except ImportError:
         pass
 
@@ -313,40 +315,57 @@ def compute_class_weights(y: np.ndarray, num_classes: int, strategy: str = "bala
 
 
 # =============================================================================
-# TensorFlow / device setup
+# PyTorch / device setup
 # =============================================================================
 
-def configure_device(device: str) -> None:
+def configure_device(device: str):
     """
-    Configure TensorFlow's visible devices. Kept in one place so device
-    selection never has to be duplicated (or forgotten) elsewhere.
+    Resolves config.experiment.device ("cpu" | "gpu") to a torch.device,
+    which callers then pass explicitly into every model constructor
+    (LSTMAttackPredictor/TransformerAttackPredictor/DQNAgent/PPOAgent all
+    take a `device=` kwarg). This is a real API change from the Keras
+    version, which configured TF's GPU visibility as global process
+    state and never threaded a device object through call sites --
+    PyTorch has no equivalent global "restrict visible devices" switch,
+    so being explicit here is the idiomatic PyTorch way rather than a
+    workaround.
+
+    Returns torch.device("cpu") unconditionally for device="cpu". For
+    device="gpu", returns a CUDA device if one is visible, else falls
+    back to CPU with a warning (matching the Keras version's fallback
+    behavior for device="gpu" with no GPU present).
     """
-    import tensorflow as tf
+    import torch
 
     if device == "cpu":
-        tf.config.set_visible_devices([], "GPU")
-        logger.info("TensorFlow restricted to CPU (config.experiment.device=cpu).")
-        return
+        logger.info("Using CPU (config.experiment.device=cpu).")
+        return torch.device("cpu")
 
-    gpus = tf.config.list_physical_devices("GPU")
-    if not gpus:
-        logger.warning("device=gpu requested but no GPU visible to TensorFlow; falling back to CPU.")
-        return
+    if torch.cuda.is_available():
+        logger.info("Using GPU: %s", torch.cuda.get_device_name(0))
+        return torch.device("cuda")
 
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-    logger.info("TensorFlow using %d GPU(s) with memory growth enabled.", len(gpus))
+    logger.warning("device=gpu requested but no CUDA device visible to PyTorch; falling back to CPU.")
+    return torch.device("cpu")
 
 
-def reset_tf_session() -> None:
+def reset_torch_session() -> None:
     """
-    Clear the Keras/TF backend graph and free session state. Call this
-    between agent (re)initializations within a single process -- repeatedly
-    building models without clearing sessions is a common source of
-    creeping GPU/CPU memory growth over long training runs.
+    Frees cached CUDA memory and runs a Python GC pass between agent
+    (re)initializations within a single process. PyTorch has no
+    equivalent to Keras's persistent global default graph/session, so
+    this is less critical here than `reset_tf_session` was for the Keras
+    version -- but repeatedly building and discarding nn.Module instances
+    can still leave cached CUDA allocator blocks around, so this is kept
+    as a cheap, explicit reset point at the same call site the Keras
+    version used (train_attack_predictor, before building each new
+    predictor).
     """
-    import tensorflow as tf
-    tf.keras.backend.clear_session()
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # =============================================================================

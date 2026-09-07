@@ -1,16 +1,46 @@
 """
 models.py
 ---------
-TensorFlow/Keras implementations of the three learned components of
-CM-MTD: the LSTM attack predictor (Section VI-A), the upper-layer DQN
+PyTorch implementations of the three learned components of CM-MTD: the
+attack predictor (LSTM or Transformer, Section VI-A), the upper-layer DQN
 over macro-actions (Section VI-B, Eq. 13-14), and the lower-layer PPO
 over micro-actions (Section VI-B, Eq. 15-17).
 
-Everything here is pure TensorFlow/Keras (no PyTorch). A prior iteration
-of this project mixed TF (LSTM/DQN) with PyTorch (PPO) and hit GPU memory
-contention between the two runtimes; standardizing on one framework
-avoids that class of bug entirely, and keeps `config_parser.configure_device`
-sufficient to control every model in the pipeline.
+MIGRATION NOTE (TensorFlow/Keras -> PyTorch): this file was previously
+pure TensorFlow/Keras, itself a deliberate standardization after an
+EARLIER iteration mixed TF (LSTM/DQN) with PyTorch (PPO) and hit GPU
+memory contention between the two runtimes (see README's "Known failure
+modes"). That principle -- one framework, end-to-end, never two runtimes
+sharing a GPU -- still holds; only WHICH framework changed. Everything
+below is pure PyTorch (no TensorFlow), so `config_parser.configure_device`
+remains sufficient to control every model in the pipeline, same as before.
+
+The public interface of every class here (constructor signature minus
+the explicit `device` argument, `fit`/`predict_next_events`/
+`predict_proba`/`predict_labels`/`compute_fidelity` for the predictors,
+`select_action`/`store`/`train_step` for DQNAgent, `select_action`/
+`compute_gae`/`update` for PPOAgent) is unchanged from the Keras version,
+so environment.py and main.py's calling code did not need to change
+shape -- only how each class is built and checkpointed.
+
+Performance note carried over from the Keras version: `predict_next_events`
+(LSTMAttackPredictor/TransformerAttackPredictor) and `select_action`
+(DQNAgent/PPOAgent) are each called once per RL environment step --
+millions of times across a full run (T×K×M ≈ 6.25M at config.yaml's
+defaults). The Keras version wrapped every such call in `tf.function` to
+avoid ~30ms/call of eager dispatch overhead. PyTorch's eager mode has
+materially less per-call Python overhead than TF1-style eager execution
+did, and every hot-path inference call below runs under
+`torch.inference_mode()` (a stricter/faster variant of `torch.no_grad()`)
+rather than full autograd-tracked eager mode. This has NOT been
+independently re-benchmarked against the old tf.function numbers at real
+config.yaml scale (10,000 episodes) -- if a full run's wall-clock time
+looks materially worse than the README's ~14-hour CPU figure, profile
+`select_action`/`predict_next_events` first; `torch.compile()` on the
+relevant `nn.Module`s is the natural next lever, deliberately not applied
+here since `torch.compile` on Windows/CPU (Emma's dev machine) is a much
+newer, less battle-tested path than the same feature on Linux, and this
+migration is large enough already without also debugging that.
 """
 
 from __future__ import annotations
@@ -20,9 +50,9 @@ from collections import deque
 from typing import Optional
 
 import numpy as np
-import tensorflow as tf
-import keras
-from tensorflow.keras import layers
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 logger = logging.getLogger("cm_mtd")
 
@@ -33,7 +63,27 @@ def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     return e / np.sum(e, axis=axis, keepdims=True)
 
 
-@keras.saving.register_keras_serializable(package="cm_mtd")
+class SimpleHistory:
+    """
+    Minimal stand-in for keras.callbacks.History -- just a `.history`
+    dict of per-epoch metric lists ({"loss": [...], "accuracy": [...],
+    "val_loss": [...], "val_accuracy": [...]}). main.py does
+    `json.dump(history.history, ...)` and generate_figures.py reads
+    `history["loss"]`/`history["accuracy"]`/etc. straight out of that
+    JSON -- keeping this shape identical to Keras's History means neither
+    of those call sites needed to change for the PyTorch migration.
+    """
+
+    def __init__(self):
+        self.history: dict = {"loss": [], "accuracy": [], "val_loss": [], "val_accuracy": []}
+
+    def record(self, loss, accuracy, val_loss, val_accuracy) -> None:
+        self.history["loss"].append(float(loss))
+        self.history["accuracy"].append(float(accuracy))
+        self.history["val_loss"].append(float(val_loss))
+        self.history["val_accuracy"].append(float(val_accuracy))
+
+
 def categorical_focal_loss(gamma: float = 2.0):
     """
     Focal loss for multi-class classification (Lin et al., 2017, "Focal
@@ -52,23 +102,69 @@ def categorical_focal_loss(gamma: float = 2.0):
     regardless of class) and concentrates gradient signal on whatever's
     currently hard to classify. This adapts continuously through
     training rather than fixing one ratio up front, and composes with
-    class_weight (Keras applies class_weight as a per-sample multiplier
-    on top of whatever loss function returns, so the two aren't
-    mutually exclusive -- though typically you'd use one or the other).
+    class_weight (applied below as a per-sample multiplier on top of
+    whatever this returns, same as Keras's class_weight semantics --
+    though typically you'd use one or the other).
 
-    Registered via @keras.saving.register_keras_serializable so a saved
-    model using this loss can be reloaded in a fresh process (plain
-    closures aren't deserializable -- without this, loading a checkpoint
-    trained with loss_function="focal" raises
-    "Could not locate function 'loss_fn'").
+    Returns a callable (logits, target_idx, sample_weight=None) -> mean
+    scalar loss, matching how _build_loss_fn's other branches are shaped.
     """
-    @keras.saving.register_keras_serializable(package="cm_mtd")
-    def loss_fn(y_true, y_pred):
-        y_pred = tf.clip_by_value(y_pred, 1e-8, 1.0 - 1e-8)
-        cross_entropy = -y_true * tf.math.log(y_pred)
-        modulating_factor = tf.pow(1.0 - y_pred, gamma)
-        return tf.reduce_sum(modulating_factor * cross_entropy, axis=-1)
+    def loss_fn(logits: torch.Tensor, target_idx: torch.Tensor,
+                sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
+        num_classes = logits.shape[-1]
+        probs = F.softmax(logits, dim=-1).clamp(1e-8, 1.0 - 1e-8)
+        log_probs = torch.log(probs)
+        target_onehot = F.one_hot(target_idx, num_classes=num_classes).float()
+        cross_entropy = -target_onehot * log_probs
+        modulating_factor = (1.0 - probs) ** gamma
+        per_sample = (modulating_factor * cross_entropy).sum(dim=-1)
+        if sample_weight is not None:
+            per_sample = per_sample * sample_weight
+        return per_sample.mean()
     return loss_fn
+
+
+def _build_loss_fn(loss_name: str, focal_gamma: float = 2.0):
+    """
+    Returns a callable (logits, target_idx, sample_weight=None) -> mean
+    scalar loss for whichever loss_function config.yaml names.
+    class_weight is applied as a PER-SAMPLE multiplier looked up by each
+    sample's true class -- see _class_weight_tensor below -- matching
+    Keras's class_weight semantics (a per-sample, not per-batch, scale).
+    """
+    if loss_name == "focal":
+        return categorical_focal_loss(gamma=focal_gamma)
+
+    if loss_name == "categorical_crossentropy":
+        def loss_fn(logits, target_idx, sample_weight=None):
+            per_sample = F.cross_entropy(logits, target_idx, reduction="none")
+            if sample_weight is not None:
+                per_sample = per_sample * sample_weight
+            return per_sample.mean()
+        return loss_fn
+
+    if loss_name == "mse":
+        def loss_fn(logits, target_idx, sample_weight=None):
+            num_classes = logits.shape[-1]
+            probs = F.softmax(logits, dim=-1)
+            target_onehot = F.one_hot(target_idx, num_classes=num_classes).float()
+            per_sample = F.mse_loss(probs, target_onehot, reduction="none").mean(dim=-1)
+            if sample_weight is not None:
+                per_sample = per_sample * sample_weight
+            return per_sample.mean()
+        return loss_fn
+
+    raise ValueError(f"Unknown loss_function: {loss_name!r} (expected 'focal', "
+                      f"'categorical_crossentropy', or 'mse')")
+
+
+def _class_weight_tensor(class_weight: Optional[dict], num_classes: int, device: torch.device) -> Optional[torch.Tensor]:
+    if class_weight is None:
+        return None
+    w = torch.ones(num_classes, dtype=torch.float32, device=device)
+    for c, weight in class_weight.items():
+        w[int(c)] = float(weight)
+    return w
 
 
 # =============================================================================
@@ -82,18 +178,19 @@ class EventClassifier:
     this as "detection logs" -- in a real deployment this role is played
     by existing IDS/firewall/NetFlow tooling; here it's a Random Forest.
 
+    Unaffected by the TF->PyTorch migration -- always scikit-learn, never
+    part of either deep learning framework.
+
     This exists because an earlier design fed raw per-row features
     directly into the sequence model's sliding window (reasoning: richer
     input should help). scripts/diagnose_separability.py proved that
     backwards: a plain Random Forest gets very high recall directly from
     these features, while the identical features framed as a sequence
     collapsed to a majority-class predictor no matter how the
-    loss/class-weighting was tuned. The features were never the problem;
-    treating flow-level rows (no inherent row-to-row temporal coherence)
-    as a time series was. This classifier does the part the data is
-    actually good for -- per-row classification -- and hands its output
-    to Stage 2 below, which does the part that's genuinely sequential:
-    predicting the next label from recent label history.
+    loss/class-weighting was tuned. This classifier does the part the
+    data is actually good for -- per-row classification -- and hands its
+    output to Stage 2 below, which does the part that's genuinely
+    sequential: predicting the next label from recent label history.
 
     input_dim/num_classes are inferred from the data, never hardcoded.
     """
@@ -140,6 +237,57 @@ class EventClassifier:
 # sequences (Section VI-A, Eq. 11-12, Fig. 4)
 # =============================================================================
 
+class _LSTMNet(nn.Module):
+    """
+    Embedding(num_classes, embedding_dim) ("event embedding layer", Fig.
+    4) -> stacked LSTM -> Dense -> raw logits (softmax applied outside,
+    by the loss function / predict_proba, for numerically-stable
+    log-softmax during training).
+
+    One nn.Dropout is applied to the INPUT of each LSTM block rather
+    than passed as nn.LSTM's own `dropout=` kwarg -- PyTorch's nn.LSTM
+    only applies its internal dropout BETWEEN stacked layers within a
+    single nn.LSTM instance (no-op for a single-layer module, which is
+    what each stacked block is here), unlike Keras's layers.LSTM(dropout=...)
+    which applies recurrent input dropout regardless of stack depth. An
+    explicit nn.Dropout on each block's input is the direct PyTorch
+    equivalent of what the Keras version's per-layer `dropout=cfg["dropout"]`
+    was doing.
+    """
+
+    def __init__(self, num_classes: int, embedding_dim: int, lstm_units: list,
+                 dense_units: list, dropout: float):
+        super().__init__()
+        self.embedding = nn.Embedding(num_classes, embedding_dim)
+
+        self.lstm_dropouts = nn.ModuleList()
+        self.lstm_blocks = nn.ModuleList()
+        input_size = embedding_dim
+        for units in lstm_units:
+            self.lstm_dropouts.append(nn.Dropout(dropout))
+            self.lstm_blocks.append(nn.LSTM(input_size, units, batch_first=True))
+            input_size = units
+        self.post_lstm_dropout = nn.Dropout(dropout)
+
+        dense_layers = []
+        prev = input_size
+        for units in dense_units:
+            dense_layers += [nn.Linear(prev, units), nn.ReLU(), nn.Dropout(dropout)]
+            prev = units
+        self.dense = nn.Sequential(*dense_layers)
+        self.out = nn.Linear(prev, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.embedding(x)  # (batch, seq_len, embedding_dim)
+        for drop, lstm in zip(self.lstm_dropouts, self.lstm_blocks):
+            h = drop(h)
+            h, _ = lstm(h)
+        h_last = h[:, -1, :]  # final timestep -- analogue of Keras's return_sequences=False on the last layer
+        h_last = self.post_lstm_dropout(h_last)
+        h_last = self.dense(h_last)
+        return self.out(h_last)
+
+
 class LSTMAttackPredictor:
     """
     Predicts the next security-event class from the recent SEQUENCE of
@@ -148,55 +296,23 @@ class LSTMAttackPredictor:
     the LSTM's input is already-classified discrete events from detection
     logs, not raw continuous features -- see EventClassifier's docstring
     for why this project moved to a two-stage design.
-
-    Architecture: Embedding(num_classes, embedding_dim) ("event embedding
-    layer", Fig. 4) -> stacked LSTM -> Dense -> Softmax(num_classes).
     """
 
-    def __init__(self, num_classes: int, cfg: dict):
+    def __init__(self, num_classes: int, cfg: dict, device: Optional[torch.device] = None):
         self.num_classes = num_classes
         self.cfg = cfg
         self.sequence_length = cfg["sequence_length"]
-        self.model = self._build_model()
-        # Plain eager __call__ still costs ~30ms/call of pure Python/TF
-        # dispatch overhead regardless of input size -- irrelevant for
-        # training (one call per batch) but fatal for this method, which
-        # is invoked once per RL environment step (millions of times over
-        # a full run). tf.function traces the graph once (input shape here
-        # never changes) and then runs at native speed (~1ms/call).
-        self._infer_fn = tf.function(
-            lambda x: self.model(x, training=False), reduce_retracing=True
-        )
-
-    def _build_model(self) -> keras.Model:
-        cfg = self.cfg
-        inputs = layers.Input(shape=(self.sequence_length,), dtype="int32", name="event_label_sequence")
-        x = layers.Embedding(self.num_classes, cfg["embedding_dim"], name="event_embedding")(inputs)
-
-        lstm_units = cfg["lstm_units"]
-        for i, units in enumerate(lstm_units):
-            return_sequences = i < len(lstm_units) - 1
-            x = layers.LSTM(units, return_sequences=return_sequences, dropout=cfg["dropout"],
-                             name=f"lstm_{i}")(x)
-
-        for units in cfg["dense_units"]:
-            x = layers.Dense(units, activation="relu")(x)
-            x = layers.Dropout(cfg["dropout"])(x)
-
-        outputs = layers.Dense(self.num_classes, activation="softmax", name="event_softmax")(x)
-
-        model = keras.Model(inputs, outputs, name="lstm_attack_predictor")
-        loss_name = cfg.get("loss_function", "categorical_crossentropy")
-        loss = categorical_focal_loss(gamma=cfg.get("focal_gamma", 2.0)) if loss_name == "focal" else loss_name
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=cfg["learning_rate"]),
-            loss=loss,
-            metrics=["accuracy"],
-        )
-        return model
+        self.device = device or torch.device("cpu")
+        self.model = _LSTMNet(
+            num_classes=num_classes, embedding_dim=cfg["embedding_dim"],
+            lstm_units=cfg["lstm_units"], dense_units=cfg["dense_units"], dropout=cfg["dropout"],
+        ).to(self.device)
+        self._loss_fn = _build_loss_fn(cfg.get("loss_function", "categorical_crossentropy"),
+                                        cfg.get("focal_gamma", 2.0))
+        self._optimizer = torch.optim.Adam(self.model.parameters(), lr=cfg["learning_rate"])
 
     def build_sliding_windows(self, event_labels: np.ndarray,
-                               target_labels: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
+                               target_labels: Optional[np.ndarray] = None) -> tuple:
         """
         event_labels: 1D array of per-row classified event ids (Stage 1's
         output), in genuine chronological order.
@@ -216,60 +332,125 @@ class LSTMAttackPredictor:
                 f"Only {len(event_labels)} rows, fewer than sequence_length={L}; "
                 f"cannot build any training windows."
             )
-        windows = np.stack([event_labels[i:i + L] for i in range(n)], axis=0).astype(np.int32)
+        windows = np.stack([event_labels[i:i + L] for i in range(n)], axis=0).astype(np.int64)
         targets = target_labels[L:L + n]
         return windows, targets
 
     def fit(self, event_labels: np.ndarray, target_labels: Optional[np.ndarray] = None,
-            class_weight: Optional[dict] = None, seed: int = 42):
+            class_weight: Optional[dict] = None, seed: int = 42) -> SimpleHistory:
         windows, targets = self.build_sliding_windows(event_labels, target_labels)
 
-        # Same validation-representativeness fix as before: Keras's
-        # validation_split slices a contiguous tail off whatever array you
-        # pass it. Shuffling WINDOWS (each window's own internal seq_len
-        # ordering untouched) before the split keeps that tail
-        # representative instead of one homogeneous chunk.
+        # Same validation-representativeness fix as the Keras version:
+        # Keras's validation_split slices a contiguous tail off whatever
+        # array you pass it, so this project shuffles at the WINDOW level
+        # (each window's own internal seq_len ordering untouched) before
+        # taking that tail, keeping it representative instead of one
+        # homogeneous chunk. Kept identical here even though this training
+        # loop is hand-rolled, not Keras's -- the tail-slice-as-val-set
+        # convention is preserved for continuity with past history/figures.
         rng = np.random.RandomState(seed)
         perm = rng.permutation(len(windows))
         windows, targets = windows[perm], targets[perm]
 
-        y_onehot = keras.utils.to_categorical(targets, num_classes=self.num_classes)
-        logger.info("Training LSTM predictor on %d label-sequence windows (seq_len=%d, num_classes=%d)",
-                    len(windows), self.sequence_length, self.num_classes)
-        history = self.model.fit(
-            windows, y_onehot,
-            batch_size=self.cfg["batch_size"],
-            epochs=self.cfg["epochs"],
-            validation_split=self.cfg["validation_split"],
-            class_weight=class_weight,
-            verbose=2,
-        )
+        val_split = self.cfg["validation_split"]
+        n_val = int(len(windows) * val_split)
+        n_train = len(windows) - n_val
+        X_train, y_train = windows[:n_train], targets[:n_train]
+        X_val, y_val = windows[n_train:], targets[n_train:]
+
+        weight_tensor = _class_weight_tensor(class_weight, self.num_classes, self.device)
+
+        logger.info("Training LSTM predictor on %d label-sequence windows (seq_len=%d, num_classes=%d), "
+                    "%d train / %d val", len(windows), self.sequence_length, self.num_classes, n_train, n_val)
+
+        history = SimpleHistory()
+        batch_size = self.cfg["batch_size"]
+        epochs = self.cfg["epochs"]
+
+        X_train_t = torch.as_tensor(X_train, dtype=torch.long, device=self.device)
+        y_train_t = torch.as_tensor(y_train, dtype=torch.long, device=self.device)
+        X_val_t = torch.as_tensor(X_val, dtype=torch.long, device=self.device)
+        y_val_t = torch.as_tensor(y_val, dtype=torch.long, device=self.device)
+
+        for epoch in range(epochs):
+            self.model.train()
+            epoch_rng = np.random.RandomState(seed + epoch)
+            perm_t = torch.as_tensor(epoch_rng.permutation(n_train), device=self.device)
+            running_loss, running_correct = 0.0, 0
+            for start in range(0, n_train, batch_size):
+                idx = perm_t[start:start + batch_size]
+                xb, yb = X_train_t[idx], y_train_t[idx]
+                sw = weight_tensor[yb] if weight_tensor is not None else None
+
+                self._optimizer.zero_grad()
+                logits = self.model(xb)
+                loss = self._loss_fn(logits, yb, sw)
+                loss.backward()
+                self._optimizer.step()
+
+                running_loss += loss.detach().item() * len(xb)
+                running_correct += int((logits.argmax(dim=-1) == yb).sum())
+
+            train_loss = running_loss / max(n_train, 1)
+            train_acc = running_correct / max(n_train, 1)
+
+            self.model.eval()
+            with torch.inference_mode():
+                val_logits = self._batched_forward(X_val_t, batch_size)
+                val_loss = self._loss_fn(val_logits, y_val_t, None).item() if n_val > 0 else float("nan")
+                val_acc = float((val_logits.argmax(dim=-1) == y_val_t).float().mean()) if n_val > 0 else float("nan")
+
+            history.record(train_loss, train_acc, val_loss, val_acc)
+            logger.info("Epoch %d/%d - loss: %.4f - accuracy: %.4f - val_loss: %.4f - val_accuracy: %.4f",
+                        epoch + 1, epochs, train_loss, train_acc, val_loss, val_acc)
+
         return history
+
+    def _batched_forward(self, X: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Runs self.model over X in chunks (no_grad context is the caller's responsibility)."""
+        outs = []
+        for start in range(0, len(X), batch_size):
+            outs.append(self.model(X[start:start + batch_size]))
+        return torch.cat(outs, dim=0) if outs else torch.empty(0, self.num_classes, device=self.device)
 
     def predict_next_events(self, label_window: np.ndarray) -> np.ndarray:
         """
         label_window: (n_nodes, seq_len) integer event-label sequences ->
         returns the argmax predicted class id per node, shape (n_nodes,).
         This is exactly the SMDP network state S_t (Section III-C-1).
+
+        Runs under torch.inference_mode() rather than plain eager
+        autograd-tracked mode -- this is called once per RL environment
+        step (millions of times over a full run), the same hot path the
+        Keras version's tf.function compilation targeted. See this
+        module's docstring for the honest caveat on relative throughput.
         """
-        x = tf.convert_to_tensor(label_window, dtype=tf.int32)
-        probs = self._infer_fn(x).numpy()
-        return np.argmax(probs, axis=-1)
+        self.model.eval()
+        x = torch.as_tensor(label_window, dtype=torch.long, device=self.device)
+        with torch.inference_mode():
+            logits = self.model(x)
+            return logits.argmax(dim=-1).cpu().numpy()
 
     def predict_proba(self, label_window: np.ndarray) -> np.ndarray:
-        x = tf.convert_to_tensor(label_window, dtype=tf.int32)
-        return self._infer_fn(x).numpy()
+        self.model.eval()
+        x = torch.as_tensor(label_window, dtype=torch.long, device=self.device)
+        with torch.inference_mode():
+            logits = self.model(x)
+            return F.softmax(logits, dim=-1).cpu().numpy()
 
     def predict_labels(self, event_labels: np.ndarray,
-                        target_labels: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
+                        target_labels: Optional[np.ndarray] = None) -> tuple:
         """
         Returns (y_true, y_pred) over sliding windows -- the raw material
         for a confusion matrix (paper's Fig. 8) or any metric beyond the
         single fidelity scalar in compute_fidelity().
         """
         windows, targets = self.build_sliding_windows(event_labels, target_labels)
-        probs = self.model.predict(windows, verbose=0)
-        preds = np.argmax(probs, axis=-1)
+        self.model.eval()
+        x = torch.as_tensor(windows, dtype=torch.long, device=self.device)
+        with torch.inference_mode():
+            logits = self._batched_forward(x, self.cfg["batch_size"])
+            preds = logits.argmax(dim=-1).cpu().numpy()
         return targets, preds
 
     def compute_fidelity(self, event_labels: np.ndarray, target_labels: Optional[np.ndarray] = None) -> dict:
@@ -293,58 +474,75 @@ class LSTMAttackPredictor:
 # Stage 2 (alternative): Transformer Attack Predictor
 # =============================================================================
 
-@keras.saving.register_keras_serializable(package="cm_mtd")
-class PositionalEmbedding(layers.Layer):
+class _TransformerBlock(nn.Module):
+    """One [MultiHeadAttention -> Add&Norm -> position-wise FFN -> Add&Norm] block."""
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads,
+                                           dropout=dropout, batch_first=True)
+        self.attn_norm = nn.LayerNorm(d_model, eps=1e-6)
+        self.ffn = nn.Sequential(nn.Linear(d_model, d_ff), nn.ReLU(), nn.Linear(d_ff, d_model))
+        self.ffn_norm = nn.LayerNorm(d_model, eps=1e-6)
+
+    def forward(self, x: torch.Tensor, need_weights: bool = False):
+        attn_out, attn_weights = self.attn(x, x, x, need_weights=need_weights, average_attn_weights=False)
+        x = self.attn_norm(x + attn_out)
+        ffn_out = self.ffn(x)
+        x = self.ffn_norm(x + ffn_out)
+        return x, attn_weights
+
+
+class _TransformerNet(nn.Module):
     """
-    A learned per-position embedding table, added directly to the token
-    embeddings it's called on. Deliberately NOT implemented as a separate
-    Embedding layer called on a tf.range() constant -- that constant has
-    no dependency on the model's Input, so Keras's functional-model graph
-    tracing does not reliably keep it retrievable via get_layer() after a
-    save/load round trip (confirmed by testing: it silently vanishes from
-    model.layers). Implementing this as a proper Layer with its own
-    add_weight(), called directly on the token embeddings (which DO derive
-    from Input), keeps it correctly connected and serializable.
+    Token Embedding(num_classes, d_model) + learned positional embedding
+    (nn.Parameter, analogous to the Keras version's custom
+    PositionalEmbedding layer -- a plain nn.Parameter needs none of that
+    layer's serialization workaround, since PyTorch's state_dict
+    save/load has no equivalent to Keras's functional-graph-tracing
+    quirk that motivated it) -> N x _TransformerBlock -> last position's
+    contextualized representation -> Dense -> raw logits.
     """
 
-    def __init__(self, sequence_length: int, d_model: int, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, num_classes: int, sequence_length: int, d_model: int, num_heads: int,
+                 num_blocks: int, d_ff: int, dense_units: list, dropout: float):
+        super().__init__()
         self.sequence_length = sequence_length
-        self.d_model = d_model
+        self.num_blocks = num_blocks
+        self.embedding = nn.Embedding(num_classes, d_model)
+        self.pos_embedding = nn.Parameter(torch.randn(sequence_length, d_model) * 0.02)
+        self.blocks = nn.ModuleList([
+            _TransformerBlock(d_model, num_heads, d_ff, dropout) for _ in range(num_blocks)
+        ])
 
-    def build(self, input_shape):
-        self.pos_embedding = self.add_weight(
-            name="pos_embedding_table",
-            shape=(self.sequence_length, self.d_model),
-            initializer="random_normal",
-            trainable=True,
-        )
-        super().build(input_shape)
+        dense_layers = []
+        prev = d_model
+        for units in dense_units:
+            dense_layers += [nn.Linear(prev, units), nn.ReLU(), nn.Dropout(dropout)]
+            prev = units
+        self.dense = nn.Sequential(*dense_layers)
+        self.out = nn.Linear(prev, num_classes)
 
-    def call(self, token_embeddings):
-        return token_embeddings + self.pos_embedding[tf.newaxis, :, :]
+    def _embed(self, x: torch.Tensor) -> torch.Tensor:
+        return self.embedding(x) + self.pos_embedding.unsqueeze(0)
 
-    def get_config(self):
-        config = super().get_config()
-        config.update({"sequence_length": self.sequence_length, "d_model": self.d_model})
-        return config
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self._embed(x)
+        for block in self.blocks:
+            h, _ = block(h, need_weights=False)
+        h_last = h[:, -1, :]  # last position's contextualized representation (LSTM final-hidden-state analogue)
+        h_last = self.dense(h_last)
+        return self.out(h_last)
 
-
-@keras.saving.register_keras_serializable(package="cm_mtd")
-class LastPositionSlice(layers.Layer):
-    """
-    Extracts the last timestep's representation from a
-    (batch, seq_len, d_model) tensor -- the Transformer's analogue of an
-    LSTM's final hidden state. NOT implemented as layers.Lambda(lambda
-    t: t[:, -1, :]): Keras 3 refuses to deserialize a Lambda wrapping a
-    Python closure by default (arbitrary-code-execution risk), which
-    would break loading a saved checkpoint in a fresh process -- the same
-    class of bug as the focal-loss closure serialization issue elsewhere
-    in this file. A plain registered Layer subclass has no such problem.
-    """
-
-    def call(self, x):
-        return x[:, -1, :]
+    def forward_with_attention(self, x: torch.Tensor, target_block: int) -> torch.Tensor:
+        """Runs blocks [0, target_block] and returns THAT block's attention weights."""
+        h = self._embed(x)
+        for i, block in enumerate(self.blocks):
+            need_weights = (i == target_block)
+            h, attn_weights = block(h, need_weights=need_weights)
+            if need_weights:
+                return attn_weights
+        raise ValueError(f"target_block={target_block} out of range for {self.num_blocks} blocks")
 
 
 class TransformerAttackPredictor:
@@ -356,36 +554,22 @@ class TransformerAttackPredictor:
     an honest negative result from scripts/compare_architectures.py:
 
       - Predictive fidelity and class-fairness are statistically tied with
-        the LSTM on matched synthetic validation data (both architectures
-        learned the same short, low-cardinality event sequence equally
-        well) -- this is a "no regression" result, not a predictive win.
-      - Initial justification for this change assumed attention's
-        parallelizability would train faster than an LSTM's sequential
-        recurrence. Measured head-to-head (scripts/compare_architectures.py,
-        CPU, seq_len=10), that did NOT hold: the Transformer took ~1.7-2x
-        longer to train and used more estimated energy than the LSTM at
-        this scale. Self-attention's O(L^2) cost across 2 blocks x 4 heads
-        outweighs recurrence's sequential-but-O(L) cost when L is this
-        short; the parallelization advantage this architecture is known
-        for is real but needs longer sequences and/or GPU execution to
-        manifest, neither of which apply here. Reported plainly rather
-        than omitted.
+        the LSTM on matched synthetic validation data -- this is a "no
+        regression" result, not a predictive win.
+      - The Transformer is NOT faster: self-attention's O(L^2) cost
+        across multiple blocks/heads outweighs recurrence's
+        sequential-but-O(L) cost at this short a sequence length. The
+        parallelization advantage this architecture is known for is real
+        but needs longer sequences and/or GPU execution to manifest.
       - The genuine, scale-independent advantage is interpretability:
         self-attention gives a directly inspectable weight over "which
         past events mattered for this prediction" (see
         get_attention_weights() / metrics.py::attention_entropy) that an
         LSTM's opaque final hidden state does not offer without a separate
-        post-hoc method (e.g. SHAP/LIME) bolted on. This is the actual
-        basis for preferring it here, not speed.
-
-    Architecture: token Embedding(num_classes, d_model) + learned
-    positional Embedding(seq_len, d_model) -> N x [MultiHeadAttention ->
-    Add&Norm -> position-wise FeedForward -> Add&Norm] -> take the last
-    position's contextualized representation (analogous to an LSTM's
-    final hidden state) -> Dense -> Softmax(num_classes).
+        post-hoc method (e.g. SHAP/LIME) bolted on.
     """
 
-    def __init__(self, num_classes: int, cfg: dict):
+    def __init__(self, num_classes: int, cfg: dict, device: Optional[torch.device] = None):
         self.num_classes = num_classes
         self.cfg = cfg
         self.sequence_length = cfg["sequence_length"]
@@ -393,66 +577,20 @@ class TransformerAttackPredictor:
         self.num_heads = cfg.get("num_heads", 4)
         self.num_blocks = cfg.get("num_transformer_blocks", 2)
         self.d_ff = cfg.get("d_ff", self.d_model * 4)
-        self.model = self._build_model()
-        self._infer_fn = tf.function(
-            lambda x: self.model(x, training=False), reduce_retracing=True
-        )
-
-    def _build_model(self) -> keras.Model:
-        cfg = self.cfg
-        L = self.sequence_length
-
-        inputs = layers.Input(shape=(L,), dtype="int32", name="event_label_sequence")
-
-        token_emb = layers.Embedding(self.num_classes, self.d_model, name="event_embedding")(inputs)
-        # Learned positional embedding: with a short, FIXED sequence length,
-        # a learned table is simpler than sinusoidal encoding and just as
-        # effective -- there's no need to generalize beyond length L. See
-        # PositionalEmbedding's docstring for why this is a custom Layer
-        # rather than a separate Embedding(...)(tf.range(...)) call.
-        x = PositionalEmbedding(L, self.d_model, name="position_embedding")(token_emb)
-
-        for i in range(self.num_blocks):
-            attn_out = layers.MultiHeadAttention(
-                num_heads=self.num_heads, key_dim=self.d_model // self.num_heads,
-                dropout=cfg["dropout"], name=f"self_attention_{i}",
-            )(x, x)  # self-attention: query=key=value=x
-            x = layers.LayerNormalization(epsilon=1e-6, name=f"attn_norm_{i}")(x + attn_out)
-
-            ffn = keras.Sequential([
-                layers.Dense(self.d_ff, activation="relu"),
-                layers.Dense(self.d_model),
-            ], name=f"ffn_{i}")
-            ffn_out = ffn(x)
-            x = layers.LayerNormalization(epsilon=1e-6, name=f"ffn_norm_{i}")(x + ffn_out)
-
-        # Last position's contextualized representation -- it has attended
-        # over the full window and plays the same role an LSTM's final
-        # hidden state would (the target we predict is the row immediately
-        # AFTER this window, so there's no leakage in using full
-        # bidirectional attention within the window itself).
-        x = LastPositionSlice(name="last_position")(x)
-
-        for units in cfg["dense_units"]:
-            x = layers.Dense(units, activation="relu")(x)
-            x = layers.Dropout(cfg["dropout"])(x)
-
-        outputs = layers.Dense(self.num_classes, activation="softmax", name="event_softmax")(x)
-
-        model = keras.Model(inputs, outputs, name="transformer_attack_predictor")
-        loss_name = cfg.get("loss_function", "categorical_crossentropy")
-        loss = categorical_focal_loss(gamma=cfg.get("focal_gamma", 2.0)) if loss_name == "focal" else loss_name
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=cfg["learning_rate"]),
-            loss=loss,
-            metrics=["accuracy"],
-        )
-        return model
+        self.device = device or torch.device("cpu")
+        self.model = _TransformerNet(
+            num_classes=num_classes, sequence_length=self.sequence_length, d_model=self.d_model,
+            num_heads=self.num_heads, num_blocks=self.num_blocks, d_ff=self.d_ff,
+            dense_units=cfg["dense_units"], dropout=cfg["dropout"],
+        ).to(self.device)
+        self._loss_fn = _build_loss_fn(cfg.get("loss_function", "categorical_crossentropy"),
+                                        cfg.get("focal_gamma", 2.0))
+        self._optimizer = torch.optim.Adam(self.model.parameters(), lr=cfg["learning_rate"])
 
     # -- Same windowing/fit/predict interface as LSTMAttackPredictor -----
 
     def build_sliding_windows(self, event_labels: np.ndarray,
-                               target_labels: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
+                               target_labels: Optional[np.ndarray] = None) -> tuple:
         if target_labels is None:
             target_labels = event_labels
         L = self.sequence_length
@@ -462,47 +600,100 @@ class TransformerAttackPredictor:
                 f"Only {len(event_labels)} rows, fewer than sequence_length={L}; "
                 f"cannot build any training windows."
             )
-        windows = np.stack([event_labels[i:i + L] for i in range(n)], axis=0).astype(np.int32)
+        windows = np.stack([event_labels[i:i + L] for i in range(n)], axis=0).astype(np.int64)
         targets = target_labels[L:L + n]
         return windows, targets
 
     def fit(self, event_labels: np.ndarray, target_labels: Optional[np.ndarray] = None,
-            class_weight: Optional[dict] = None, seed: int = 42):
+            class_weight: Optional[dict] = None, seed: int = 42) -> SimpleHistory:
         windows, targets = self.build_sliding_windows(event_labels, target_labels)
 
-        # Same validation-representativeness fix as LSTMAttackPredictor:
-        # shuffle at the window level before Keras's contiguous-tail split.
         rng = np.random.RandomState(seed)
         perm = rng.permutation(len(windows))
         windows, targets = windows[perm], targets[perm]
 
-        y_onehot = keras.utils.to_categorical(targets, num_classes=self.num_classes)
-        logger.info("Training Transformer predictor on %d label-sequence windows (seq_len=%d, num_classes=%d)",
-                    len(windows), self.sequence_length, self.num_classes)
-        history = self.model.fit(
-            windows, y_onehot,
-            batch_size=self.cfg["batch_size"],
-            epochs=self.cfg["epochs"],
-            validation_split=self.cfg["validation_split"],
-            class_weight=class_weight,
-            verbose=2,
-        )
+        val_split = self.cfg["validation_split"]
+        n_val = int(len(windows) * val_split)
+        n_train = len(windows) - n_val
+        X_train, y_train = windows[:n_train], targets[:n_train]
+        X_val, y_val = windows[n_train:], targets[n_train:]
+
+        weight_tensor = _class_weight_tensor(class_weight, self.num_classes, self.device)
+
+        logger.info("Training Transformer predictor on %d label-sequence windows (seq_len=%d, num_classes=%d), "
+                    "%d train / %d val", len(windows), self.sequence_length, self.num_classes, n_train, n_val)
+
+        history = SimpleHistory()
+        batch_size = self.cfg["batch_size"]
+        epochs = self.cfg["epochs"]
+
+        X_train_t = torch.as_tensor(X_train, dtype=torch.long, device=self.device)
+        y_train_t = torch.as_tensor(y_train, dtype=torch.long, device=self.device)
+        X_val_t = torch.as_tensor(X_val, dtype=torch.long, device=self.device)
+        y_val_t = torch.as_tensor(y_val, dtype=torch.long, device=self.device)
+
+        for epoch in range(epochs):
+            self.model.train()
+            epoch_rng = np.random.RandomState(seed + epoch)
+            perm_t = torch.as_tensor(epoch_rng.permutation(n_train), device=self.device)
+            running_loss, running_correct = 0.0, 0
+            for start in range(0, n_train, batch_size):
+                idx = perm_t[start:start + batch_size]
+                xb, yb = X_train_t[idx], y_train_t[idx]
+                sw = weight_tensor[yb] if weight_tensor is not None else None
+
+                self._optimizer.zero_grad()
+                logits = self.model(xb)
+                loss = self._loss_fn(logits, yb, sw)
+                loss.backward()
+                self._optimizer.step()
+
+                running_loss += loss.detach().item() * len(xb)
+                running_correct += int((logits.argmax(dim=-1) == yb).sum())
+
+            train_loss = running_loss / max(n_train, 1)
+            train_acc = running_correct / max(n_train, 1)
+
+            self.model.eval()
+            with torch.inference_mode():
+                val_logits = self._batched_forward(X_val_t, batch_size)
+                val_loss = self._loss_fn(val_logits, y_val_t, None).item() if n_val > 0 else float("nan")
+                val_acc = float((val_logits.argmax(dim=-1) == y_val_t).float().mean()) if n_val > 0 else float("nan")
+
+            history.record(train_loss, train_acc, val_loss, val_acc)
+            logger.info("Epoch %d/%d - loss: %.4f - accuracy: %.4f - val_loss: %.4f - val_accuracy: %.4f",
+                        epoch + 1, epochs, train_loss, train_acc, val_loss, val_acc)
+
         return history
 
+    def _batched_forward(self, X: torch.Tensor, batch_size: int) -> torch.Tensor:
+        outs = []
+        for start in range(0, len(X), batch_size):
+            outs.append(self.model(X[start:start + batch_size]))
+        return torch.cat(outs, dim=0) if outs else torch.empty(0, self.num_classes, device=self.device)
+
     def predict_next_events(self, label_window: np.ndarray) -> np.ndarray:
-        x = tf.convert_to_tensor(label_window, dtype=tf.int32)
-        probs = self._infer_fn(x).numpy()
-        return np.argmax(probs, axis=-1)
+        self.model.eval()
+        x = torch.as_tensor(label_window, dtype=torch.long, device=self.device)
+        with torch.inference_mode():
+            logits = self.model(x)
+            return logits.argmax(dim=-1).cpu().numpy()
 
     def predict_proba(self, label_window: np.ndarray) -> np.ndarray:
-        x = tf.convert_to_tensor(label_window, dtype=tf.int32)
-        return self._infer_fn(x).numpy()
+        self.model.eval()
+        x = torch.as_tensor(label_window, dtype=torch.long, device=self.device)
+        with torch.inference_mode():
+            logits = self.model(x)
+            return F.softmax(logits, dim=-1).cpu().numpy()
 
     def predict_labels(self, event_labels: np.ndarray,
-                        target_labels: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
+                        target_labels: Optional[np.ndarray] = None) -> tuple:
         windows, targets = self.build_sliding_windows(event_labels, target_labels)
-        probs = self.model.predict(windows, verbose=0)
-        preds = np.argmax(probs, axis=-1)
+        self.model.eval()
+        x = torch.as_tensor(windows, dtype=torch.long, device=self.device)
+        with torch.inference_mode():
+            logits = self._batched_forward(x, self.cfg["batch_size"])
+            preds = logits.argmax(dim=-1).cpu().numpy()
         return targets, preds
 
     def compute_fidelity(self, event_labels: np.ndarray, target_labels: Optional[np.ndarray] = None) -> dict:
@@ -525,32 +716,20 @@ class TransformerAttackPredictor:
         raw material for metrics.py's attention_entropy (Trust dimension)
         and for plotting "what the model looked at" per prediction.
 
-        Layers are looked up fresh via self.model.get_layer() every call,
-        rather than using references captured at construction time -- this
-        is deliberate: after loading a saved checkpoint (predictor.model
-        gets replaced with the deserialized model), stored references from
-        the original build would still point to the randomly-initialized
-        construction-time layers, silently returning attention weights
-        from untrained weights with no error. get_layer() always reflects
-        whatever weights self.model currently holds.
+        Unlike the Keras version (which had to re-fetch layers via
+        model.get_layer() on every call specifically to avoid stale
+        references after a checkpoint reload replaced predictor.model),
+        this always calls through self.model directly, so there's no
+        equivalent staleness risk to guard against -- reassigning
+        self.model.load_state_dict(...) mutates the SAME nn.Module
+        instance in place rather than swapping in a new object.
         """
         target_idx = block if block >= 0 else self.num_blocks + block
-        x = tf.convert_to_tensor(label_window, dtype=tf.int32)
-
-        h = self.model.get_layer("event_embedding")(x)
-        h = self.model.get_layer("position_embedding")(h)
-
-        for i in range(target_idx + 1):
-            attn_layer = self.model.get_layer(f"self_attention_{i}")
-            if i < target_idx:
-                attn_out = attn_layer(h, h)
-                h = self.model.get_layer(f"attn_norm_{i}")(h + attn_out)
-                ffn_out = self.model.get_layer(f"ffn_{i}")(h)
-                h = self.model.get_layer(f"ffn_norm_{i}")(h + ffn_out)
-            else:
-                _, scores = attn_layer(h, h, return_attention_scores=True)
-                return scores.numpy()
-        raise RuntimeError("Unreachable")
+        self.model.eval()
+        x = torch.as_tensor(label_window, dtype=torch.long, device=self.device)
+        with torch.inference_mode():
+            attn_weights = self.model.forward_with_attention(x, target_idx)
+        return attn_weights.cpu().numpy()
 
 
 # =============================================================================
@@ -575,6 +754,24 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+class _MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden_layers: list, out_dim: int, activation: str):
+        super().__init__()
+        act_cls = {"relu": nn.ReLU, "tanh": nn.Tanh}.get(activation)
+        if act_cls is None:
+            raise ValueError(f"Unknown activation: {activation!r} (expected 'relu' or 'tanh')")
+        layers_list = []
+        prev = in_dim
+        for units in hidden_layers:
+            layers_list += [nn.Linear(prev, units), act_cls()]
+            prev = units
+        layers_list.append(nn.Linear(prev, out_dim))
+        self.net = nn.Sequential(*layers_list)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class DQNAgent:
     """
     Upper-layer agent choosing macro-actions O = {o_c, o_a, o_r, o_s}
@@ -582,10 +779,12 @@ class DQNAgent:
     replay buffer, per Algorithm 1 lines 1, 5-6, 14-18, 35-36, 42.
     """
 
-    def __init__(self, state_dim: int, num_actions: int, cfg: dict, seed: int = 0):
+    def __init__(self, state_dim: int, num_actions: int, cfg: dict, seed: int = 0,
+                 device: Optional[torch.device] = None):
         self.state_dim = state_dim
         self.num_actions = num_actions
         self.cfg = cfg
+        self.device = device or torch.device("cpu")
         self.gamma = cfg["gamma"]
         self.epsilon = cfg["epsilon_start"]
         self.epsilon_end = cfg["epsilon_end"]
@@ -597,41 +796,21 @@ class DQNAgent:
         self.replay = ReplayBuffer(cfg["replay_buffer_size"], seed=seed)
         self._rng = np.random.RandomState(seed)
 
-        self.q_network = self._build_network()
-        self.target_network = self._build_network()
-        self.target_network.set_weights(self.q_network.get_weights())
+        self.q_network = _MLP(state_dim, cfg["hidden_layers"], num_actions, cfg["activation"]).to(self.device)
+        self.target_network = _MLP(state_dim, cfg["hidden_layers"], num_actions, cfg["activation"]).to(self.device)
+        self.target_network.load_state_dict(self.q_network.state_dict())
+        self.target_network.eval()
+        self._optimizer = torch.optim.Adam(self.q_network.parameters(), lr=cfg["learning_rate"])
         self._train_steps = 0
-
-        # Same eager-overhead problem as the LSTM predictor: select_action
-        # is called once per macro-step, train_step's two forward passes
-        # once per training step -- both add up fast across 10k+ episodes.
-        # tf.function traces each network's graph once; set_weights() on
-        # target_network later mutates the underlying tf.Variables in
-        # place, so this compiled function keeps seeing fresh weights
-        # without needing to retrace.
-        self._q_infer_fn = tf.function(
-            lambda x: self.q_network(x, training=False), reduce_retracing=True
-        )
-        self._target_infer_fn = tf.function(
-            lambda x: self.target_network(x, training=False), reduce_retracing=True
-        )
-
-    def _build_network(self) -> keras.Model:
-        inputs = layers.Input(shape=(self.state_dim,))
-        x = inputs
-        for units in self.cfg["hidden_layers"]:
-            x = layers.Dense(units, activation=self.cfg["activation"])(x)
-        outputs = layers.Dense(self.num_actions, activation="linear")(x)
-        model = keras.Model(inputs, outputs, name="dqn_q_network")
-        model.compile(optimizer=keras.optimizers.Adam(learning_rate=self.cfg["learning_rate"]), loss="mse")
-        return model
 
     def select_action(self, state: np.ndarray, greedy: bool = False) -> int:
         """Epsilon-greedy macro-action selection, Algorithm 1 lines 12-18."""
         if not greedy and self._rng.random() <= self.epsilon:
             return int(self._rng.randint(self.num_actions))
-        state_t = tf.convert_to_tensor(state[None, :], dtype=tf.float32)
-        q_values = self._q_infer_fn(state_t).numpy()[0]
+        self.q_network.eval()
+        state_t = torch.as_tensor(state[None, :], dtype=torch.float32, device=self.device)
+        with torch.inference_mode():
+            q_values = self.q_network(state_t)[0].cpu().numpy()
         return int(np.argmax(q_values))
 
     def decay_epsilon(self) -> None:
@@ -643,39 +822,66 @@ class DQNAgent:
     def train_step(self) -> Optional[float]:
         """One gradient step, Algorithm 1 lines 35-36. Returns the loss, or
         None if there isn't enough replay data yet.
-
-        Uses direct __call__ (not .predict()) and train_on_batch (not
-        .fit()) throughout -- both .predict() and .fit() rebuild
-        significant internal machinery on every call (batching pipeline,
-        callbacks, progress bars), which is fine for occasional large
-        calls but disastrous when called every training step across
-        thousands of episodes. train_on_batch() does exactly one gradient
-        update with none of that overhead.
         """
         if len(self.replay) < max(self.batch_size, self.min_replay_before_train):
             return None
 
         states, actions, rewards, next_states, dones = self.replay.sample(self.batch_size)
-        states = states.astype(np.float32)
-        next_states = next_states.astype(np.float32)
+        states_t = torch.as_tensor(states, dtype=torch.float32, device=self.device)
+        next_states_t = torch.as_tensor(next_states, dtype=torch.float32, device=self.device)
+        actions_t = torch.as_tensor(actions, dtype=torch.long, device=self.device)
+        rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
+        dones_t = torch.as_tensor(dones, dtype=torch.float32, device=self.device)
 
-        target_q_next = self._target_infer_fn(tf.convert_to_tensor(next_states)).numpy()
-        max_target_q = np.max(target_q_next, axis=1)
-        targets = self._q_infer_fn(tf.convert_to_tensor(states)).numpy()
-        targets[np.arange(self.batch_size), actions] = rewards + (1.0 - dones) * self.gamma * max_target_q
+        with torch.inference_mode():
+            target_q_next = self.target_network(next_states_t)
+            max_target_q = target_q_next.max(dim=1).values
+        y = rewards_t + (1.0 - dones_t) * self.gamma * max_target_q
 
-        loss = self.q_network.train_on_batch(states, targets)
+        self.q_network.train()
+        self._optimizer.zero_grad()
+        q_pred = self.q_network(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+        loss = F.mse_loss(q_pred, y)
+        loss.backward()
+        self._optimizer.step()
 
         self._train_steps += 1
         if self._train_steps % self.target_update_every == 0:
-            self.target_network.set_weights(self.q_network.get_weights())  # Algorithm 1 line 42
+            self.target_network.load_state_dict(self.q_network.state_dict())  # Algorithm 1 line 42
 
-        return float(loss if np.isscalar(loss) else loss[0])
+        return loss.detach().item()
 
 
 # =============================================================================
 # Lower layer: PPO over micro-actions (Section VI-B, Eq. 15-17, Table I)
 # =============================================================================
+
+class _PPOActor(nn.Module):
+    """Shared trunk, two categorical heads: per-node IP-pool logits, per-flow route logits."""
+
+    def __init__(self, state_dim: int, hidden_layers: list, activation: str,
+                 n_nodes: int, num_ip_pools: int, num_flows: int, num_route_candidates: int):
+        super().__init__()
+        act_cls = {"relu": nn.ReLU, "tanh": nn.Tanh}.get(activation)
+        if act_cls is None:
+            raise ValueError(f"Unknown activation: {activation!r} (expected 'relu' or 'tanh')")
+        trunk_layers = []
+        prev = state_dim
+        for units in hidden_layers:
+            trunk_layers += [nn.Linear(prev, units), act_cls()]
+            prev = units
+        self.trunk = nn.Sequential(*trunk_layers)
+        self.n_nodes, self.num_ip_pools = n_nodes, num_ip_pools
+        self.num_flows, self.num_route_candidates = num_flows, num_route_candidates
+        self.ip_head = nn.Linear(prev, n_nodes * num_ip_pools)
+        self.route_head = nn.Linear(prev, num_flows * num_route_candidates)
+
+    def forward(self, x: torch.Tensor):
+        h = self.trunk(x)
+        ip_logits = self.ip_head(h).view(-1, self.n_nodes, self.num_ip_pools)
+        route_logits = self.route_head(h).view(-1, self.num_flows, self.num_route_candidates)
+        return ip_logits, route_logits
+
 
 class PPOAgent:
     """
@@ -697,13 +903,15 @@ class PPOAgent:
     """
 
     def __init__(self, state_dim: int, n_nodes: int, num_ip_pools: int,
-                 num_flows: int, num_route_candidates: int, cfg: dict, seed: int = 0):
+                 num_flows: int, num_route_candidates: int, cfg: dict, seed: int = 0,
+                 device: Optional[torch.device] = None):
         self.state_dim = state_dim
         self.n_nodes = n_nodes
         self.num_ip_pools = num_ip_pools
         self.num_flows = num_flows
         self.num_route_candidates = num_route_candidates
         self.cfg = cfg
+        self.device = device or torch.device("cpu")
         self.gamma = cfg["gamma"]
         self.gae_lambda = cfg["gae_lambda"]
         self.clip_epsilon = cfg["clip_epsilon"]
@@ -712,50 +920,22 @@ class PPOAgent:
 
         self._rng = np.random.RandomState(seed)
 
-        self.actor = self._build_actor()
-        self.critic = self._build_critic()
-        self.actor_optimizer = keras.optimizers.Adam(learning_rate=cfg["learning_rate"])
-        self.critic_optimizer = keras.optimizers.Adam(learning_rate=cfg["learning_rate"])
-
-        # select_action() runs once per environment step -- the same
-        # millions-of-calls frequency as the LSTM predictor -- and
-        # update()'s inner loop runs one gradient step per minibatch per
-        # epoch, which also adds up fast. Plain eager __call__ costs
-        # ~30ms/call of pure dispatch overhead regardless of input size;
-        # tf.function compiles each graph once and runs at native speed.
-        self._actor_infer_fn = tf.function(
-            lambda x: self.actor(x, training=False), reduce_retracing=True
-        )
-        self._critic_infer_fn = tf.function(
-            lambda x: self.critic(x, training=False), reduce_retracing=True
-        )
-        self._train_step_fn = tf.function(self._train_step_impl, reduce_retracing=True)
-
-    def _build_actor(self) -> keras.Model:
-        inputs = layers.Input(shape=(self.state_dim,))
-        x = inputs
-        for units in self.cfg["hidden_layers"]:
-            x = layers.Dense(units, activation=self.cfg["activation"])(x)
-        ip_logits = layers.Dense(self.n_nodes * self.num_ip_pools, name="ip_logits_flat")(x)
-        ip_logits = layers.Reshape((self.n_nodes, self.num_ip_pools), name="ip_logits")(ip_logits)
-        route_logits = layers.Dense(self.num_flows * self.num_route_candidates, name="route_logits_flat")(x)
-        route_logits = layers.Reshape((self.num_flows, self.num_route_candidates), name="route_logits")(route_logits)
-        return keras.Model(inputs, [ip_logits, route_logits], name="ppo_actor")
-
-    def _build_critic(self) -> keras.Model:
-        inputs = layers.Input(shape=(self.state_dim,))
-        x = inputs
-        for units in self.cfg["hidden_layers"]:
-            x = layers.Dense(units, activation=self.cfg["activation"])(x)
-        value = layers.Dense(1, activation="linear")(x)
-        return keras.Model(inputs, value, name="ppo_critic")
+        self.actor = _PPOActor(state_dim, cfg["hidden_layers"], cfg["activation"],
+                                n_nodes, num_ip_pools, num_flows, num_route_candidates).to(self.device)
+        self.critic = _MLP(state_dim, cfg["hidden_layers"], 1, cfg["activation"]).to(self.device)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=cfg["learning_rate"])
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=cfg["learning_rate"])
 
     def select_action(self, state: np.ndarray):
         """Returns (action_dict, log_prob, value) for a single state."""
-        state_batch = tf.convert_to_tensor(state[None, :], dtype=tf.float32)
-        ip_logits, route_logits = self._actor_infer_fn(state_batch)
-        ip_logits = ip_logits.numpy()[0]        # (n_nodes, num_ip_pools)
-        route_logits = route_logits.numpy()[0]  # (num_flows, num_route_candidates)
+        self.actor.eval()
+        self.critic.eval()
+        state_batch = torch.as_tensor(state[None, :], dtype=torch.float32, device=self.device)
+        with torch.inference_mode():
+            ip_logits, route_logits = self.actor(state_batch)
+            value = float(self.critic(state_batch)[0, 0])
+        ip_logits = ip_logits[0].cpu().numpy()        # (n_nodes, num_ip_pools)
+        route_logits = route_logits[0].cpu().numpy()  # (num_flows, num_route_candidates)
 
         ip_probs = _softmax(ip_logits, axis=-1)
         route_probs = _softmax(route_logits, axis=-1)
@@ -771,7 +951,6 @@ class PPOAgent:
             np.sum(np.log(ip_probs[np.arange(self.n_nodes), ip_assignment] + 1e-8))
             + np.sum(np.log(route_probs[np.arange(self.num_flows), route_assignment] + 1e-8))
         )
-        value = float(self._critic_infer_fn(state_batch).numpy()[0, 0])
 
         action = {"ip_assignment": ip_assignment, "route_assignment": route_assignment}
         return action, float(log_prob), value
@@ -793,70 +972,58 @@ class PPOAgent:
         return advantages, returns
 
     def _train_step_impl(self, states, ip_actions, route_actions, old_log_probs, advantages, returns):
-        """
-        One actor + one critic gradient step on a single minibatch.
-        Wrapped in tf.function via self._train_step_fn (set in __init__) --
-        this is called once per minibatch per epoch inside update() below,
-        which without compilation would mean millions of eager
-        GradientTape passes (~30ms of pure dispatch overhead each) over a
-        full training run. Compiled, each call runs at native graph speed.
-        """
-        with tf.GradientTape() as tape:
-            ip_logits, route_logits = self.actor(states, training=True)
-            ip_log_probs_all = tf.nn.log_softmax(ip_logits, axis=-1)
-            route_log_probs_all = tf.nn.log_softmax(route_logits, axis=-1)
+        """One actor + one critic gradient step on a single minibatch."""
+        self.actor.train()
+        ip_logits, route_logits = self.actor(states)
+        ip_log_probs_all = F.log_softmax(ip_logits, dim=-1)
+        route_log_probs_all = F.log_softmax(route_logits, dim=-1)
 
-            ip_selected = tf.gather(ip_log_probs_all, ip_actions, batch_dims=2)
-            route_selected = tf.gather(route_log_probs_all, route_actions, batch_dims=2)
-            new_log_probs = tf.reduce_sum(ip_selected, axis=1) + tf.reduce_sum(route_selected, axis=1)
+        ip_selected = ip_log_probs_all.gather(2, ip_actions.unsqueeze(-1)).squeeze(-1)
+        route_selected = route_log_probs_all.gather(2, route_actions.unsqueeze(-1)).squeeze(-1)
+        new_log_probs = ip_selected.sum(dim=1) + route_selected.sum(dim=1)
 
-            ratio = tf.exp(new_log_probs - old_log_probs)
-            unclipped = ratio * advantages
-            clipped = tf.clip_by_value(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
-            policy_loss = -tf.reduce_mean(tf.minimum(unclipped, clipped))
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        unclipped = ratio * advantages
+        clipped = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
+        policy_loss = -torch.minimum(unclipped, clipped).mean()
 
-            ip_probs = tf.nn.softmax(ip_logits, axis=-1)
-            route_probs = tf.nn.softmax(route_logits, axis=-1)
-            entropy = (
-                -tf.reduce_mean(tf.reduce_sum(ip_probs * ip_log_probs_all, axis=-1))
-                - tf.reduce_mean(tf.reduce_sum(route_probs * route_log_probs_all, axis=-1))
-            )
-            actor_loss = policy_loss - self.entropy_coef * entropy
+        ip_probs = F.softmax(ip_logits, dim=-1)
+        route_probs = F.softmax(route_logits, dim=-1)
+        entropy = (
+            -(ip_probs * ip_log_probs_all).sum(dim=-1).mean()
+            - (route_probs * route_log_probs_all).sum(dim=-1).mean()
+        )
+        actor_loss = policy_loss - self.entropy_coef * entropy
 
-        actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
-        self.actor_optimizer.apply_gradients(zip(actor_grads, self.actor.trainable_variables))
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
 
-        with tf.GradientTape() as tape:
-            values_pred = tf.squeeze(self.critic(states, training=True), axis=-1)
-            critic_loss = self.value_coef * tf.reduce_mean(tf.square(returns - values_pred))
-        critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
-        self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
+        self.critic.train()
+        values_pred = self.critic(states).squeeze(-1)
+        critic_loss = self.value_coef * F.mse_loss(values_pred, returns)
 
-        return actor_loss, critic_loss
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        return actor_loss.detach().item(), critic_loss.detach().item()
 
     def update(self, states, ip_actions, route_actions, old_log_probs, advantages, returns):
         """
         Clipped-surrogate PPO update, Eq. 16-17, Algorithm 1 lines 37-40.
-        Minibatch size is fixed by config (default steps_per_macro_action
-        divides evenly by minibatch_size), so every call to
-        self._train_step_fn sees the same shape and reuses the one
-        compiled graph traced on the first call -- no retracing overhead
-        in the default configuration. If you change config such that the
-        last minibatch of an epoch has a different size than the rest,
-        that one shape will trigger an extra (one-time) retrace; still
-        correct, just marginally slower.
         """
-        states = tf.convert_to_tensor(np.asarray(states), dtype=tf.float32)
-        ip_actions = tf.convert_to_tensor(np.asarray(ip_actions), dtype=tf.int32)
-        route_actions = tf.convert_to_tensor(np.asarray(route_actions), dtype=tf.int32)
-        old_log_probs = tf.convert_to_tensor(np.asarray(old_log_probs), dtype=tf.float32)
+        states_t = torch.as_tensor(np.asarray(states), dtype=torch.float32, device=self.device)
+        ip_actions_t = torch.as_tensor(np.asarray(ip_actions), dtype=torch.long, device=self.device)
+        route_actions_t = torch.as_tensor(np.asarray(route_actions), dtype=torch.long, device=self.device)
+        old_log_probs_t = torch.as_tensor(np.asarray(old_log_probs), dtype=torch.float32, device=self.device)
 
         advantages = np.asarray(advantages, dtype=np.float32)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        advantages = tf.convert_to_tensor(advantages, dtype=tf.float32)
-        returns = tf.convert_to_tensor(np.asarray(returns), dtype=tf.float32)
+        advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
+        returns_t = torch.as_tensor(np.asarray(returns), dtype=torch.float32, device=self.device)
 
-        n = states.shape[0]
+        n = states_t.shape[0]
         minibatch_size = min(self.cfg["minibatch_size"], n)
         actor_losses, critic_losses = [], []
 
@@ -864,16 +1031,12 @@ class PPOAgent:
             idx_all = np.arange(n)
             self._rng.shuffle(idx_all)
             for start in range(0, n, minibatch_size):
-                mb_idx = idx_all[start:start + minibatch_size]
-                actor_loss, critic_loss = self._train_step_fn(
-                    tf.gather(states, mb_idx),
-                    tf.gather(ip_actions, mb_idx),
-                    tf.gather(route_actions, mb_idx),
-                    tf.gather(old_log_probs, mb_idx),
-                    tf.gather(advantages, mb_idx),
-                    tf.gather(returns, mb_idx),
+                mb_idx = torch.as_tensor(idx_all[start:start + minibatch_size], device=self.device)
+                actor_loss, critic_loss = self._train_step_impl(
+                    states_t[mb_idx], ip_actions_t[mb_idx], route_actions_t[mb_idx],
+                    old_log_probs_t[mb_idx], advantages_t[mb_idx], returns_t[mb_idx],
                 )
-                actor_losses.append(float(actor_loss))
-                critic_losses.append(float(critic_loss))
+                actor_losses.append(actor_loss)
+                critic_losses.append(critic_loss)
 
         return float(np.mean(actor_losses)), float(np.mean(critic_losses))

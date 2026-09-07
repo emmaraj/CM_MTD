@@ -14,7 +14,7 @@
 experiment:
   name: "cm_mtd"
   dataset: "cicids2017"    # "cicids2017" | "5g_nidd" — selects a datasets.<name> block below
-  predictor: "transformer" # "transformer" | "lstm" — selects the transformer:/lstm: block below
+  predictor: "lstm" # "transformer" | "lstm" — selects the transformer:/lstm: block below
   seed: 42
   device: "cpu"          # "cpu" or "gpu" — see README for the TF/GPU notes
   log_dir: "logs"
@@ -257,7 +257,7 @@ dqn:
   gamma: 0.99
   epsilon_start: 1.0
   epsilon_end: 0.05
-  epsilon_decay_episodes: 3000
+  epsilon_decay_episodes: 1200 # 3000
   replay_buffer_size: 50000
   batch_size: 64
   target_update_every: 200    # steps, theta^u_{t-n} <- theta^u_t (line 42)
@@ -286,7 +286,7 @@ ppo:
 # Training loop (Algorithm 1)
 # -----------------------------------------------------------------------------
 training:
-  num_episodes: 10000          # M in Algorithm 1 / Table I
+  num_episodes: 2000          # M in Algorithm 1 / Table I where it was 10k but I used 2k
   steps_per_episode: 25        # T in Algorithm 1 / Table I ("steps on each episode")
-  eval_every_episodes: 100
-  save_every_episodes: 500
+  eval_every_episodes:  50 #100
+  save_every_episodes: 250 # 500
